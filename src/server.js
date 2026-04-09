@@ -1,5 +1,5 @@
-// server.js — MCP tool definitions for Notion (DeFlorance + Paolo)
-// v2.3.0 — 27 tools with production-grade descriptions
+// server.js — Notion Unlocked: MCP server that breaks through Notion's standard API ceiling
+// v2.4.0 — 27 tools, multi-workspace, diff-based editing, batch ops, block-level control
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -78,8 +78,8 @@ function safeHandler(fn) {
 
 export function createServer() {
   const server = new McpServer({
-    name: 'notion-mcp-deflor',
-    version: '2.3.0',
+    name: 'notion-unlocked',
+    version: '2.4.0',
   });
 
   // ============================================================
