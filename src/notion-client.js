@@ -2,7 +2,7 @@
 // Wraps @notionhq/client with methods designed for LLM tool consumption
 
 import { Client } from '@notionhq/client';
-import { blocksToMarkdown, formatProperties, formatDatabaseSchema } from './blocks.js';
+import { blocksToMarkdown, markdownToBlocks, formatProperties, formatDatabaseSchema } from './blocks.js';
 
 class NotionClient {
   constructor() {
@@ -300,6 +300,208 @@ class NotionClient {
       email: user.person?.email || null,
       avatar: user.avatar_url,
     };
+  }
+
+  // ============================================================
+  // ARCHIVE / UNARCHIVE / DELETE PAGES
+  // ============================================================
+
+  async archivePages(pageIds) {
+    this.init();
+    const results = [];
+    for (const pid of pageIds) {
+      const id = this._cleanId(pid);
+      await this.client.pages.update({ page_id: id, archived: true });
+      results.push(id);
+    }
+    return { archived: results };
+  }
+
+  async unarchivePages(pageIds) {
+    this.init();
+    const results = [];
+    for (const pid of pageIds) {
+      const id = this._cleanId(pid);
+      await this.client.pages.update({ page_id: id, archived: false });
+      results.push(id);
+    }
+    return { unarchived: results };
+  }
+
+  async deletePages(pageIds) {
+    return this.archivePages(pageIds);
+  }
+
+  async deleteDatabases(databaseIds) {
+    return this.archivePages(databaseIds);
+  }
+
+  // ============================================================
+  // UPDATE PAGE CONTENT (oldStr/newStr diffing)
+  // ============================================================
+
+  async updatePageContent(pageId, contentUpdates) {
+    this.init();
+    const id = this._cleanId(pageId);
+
+    for (const update of contentUpdates) {
+      if (!update.oldStr) {
+        // Full replacement: delete all blocks, append new content
+        const existingBlocks = await this._getAllBlocks(id);
+        for (const block of existingBlocks) {
+          try { await this.client.blocks.update({ block_id: block.id, archived: true }); } catch (e) { /* skip undeletable */ }
+        }
+        if (update.newStr) {
+          const newBlocks = markdownToBlocks(update.newStr);
+          await this.appendContent(id, newBlocks);
+        }
+      } else {
+        // Targeted replacement: find matching blocks, replace
+        const blocks = await this._getAllBlocks(id);
+        const fullMarkdown = blocksToMarkdown(blocks);
+
+        if (!fullMarkdown.includes(update.oldStr)) {
+          throw new Error(`Content not found: "${update.oldStr.substring(0, 100)}..."`);
+        }
+
+        // Simple approach: replace in markdown, then replace all content
+        let newMarkdown;
+        if (update.replaceAllMatches) {
+          newMarkdown = fullMarkdown.split(update.oldStr).join(update.newStr);
+        } else {
+          const idx = fullMarkdown.indexOf(update.oldStr);
+          newMarkdown = fullMarkdown.substring(0, idx) + update.newStr + fullMarkdown.substring(idx + update.oldStr.length);
+        }
+
+        // Delete all existing blocks and replace with new content
+        for (const block of blocks) {
+          try { await this.client.blocks.update({ block_id: block.id, archived: true }); } catch (e) { /* skip */ }
+        }
+        const newBlocks = markdownToBlocks(newMarkdown);
+        if (newBlocks.length > 0) {
+          await this.appendContent(id, newBlocks);
+        }
+      }
+    }
+
+    return this.fetchPage(pageId);
+  }
+
+  // ============================================================
+  // BLOCK OPERATIONS
+  // ============================================================
+
+  async fetchBlockChildren(blockId, { page_size, start_cursor } = {}) {
+    this.init();
+    const id = this._cleanId(blockId);
+    const params = { block_id: id, page_size: page_size || 100 };
+    if (start_cursor) params.start_cursor = start_cursor;
+    const response = await this.client.blocks.children.list(params);
+    return {
+      results: response.results,
+      has_more: response.has_more,
+      next_cursor: response.next_cursor,
+    };
+  }
+
+  async updateBlock(blockId, data) {
+    this.init();
+    const id = this._cleanId(blockId);
+    const block = await this.client.blocks.update({ block_id: id, ...data });
+    return { id: block.id, type: block.type };
+  }
+
+  // ============================================================
+  // TWO-WAY RELATION
+  // ============================================================
+
+  async createTwoWayRelation(sourceDbId, targetDbId, sourcePropName, targetPropName) {
+    this.init();
+    const srcId = this._cleanId(sourceDbId);
+    const tgtId = this._cleanId(targetDbId);
+    const properties = {};
+    properties[sourcePropName] = {
+      type: 'relation',
+      relation: {
+        database_id: tgtId,
+        type: 'dual_property',
+        dual_property: { synced_property_name: targetPropName },
+      },
+    };
+    const db = await this.client.databases.update({ database_id: srcId, properties });
+    return {
+      source_database_id: srcId,
+      target_database_id: tgtId,
+      source_property: sourcePropName,
+      target_property: targetPropName,
+    };
+  }
+
+  // ============================================================
+  // PAGE PROPERTY (paginated retrieval)
+  // ============================================================
+
+  async getPageProperty(pageId, propertyId, { page_size, start_cursor } = {}) {
+    this.init();
+    const id = this._cleanId(pageId);
+    const params = { page_id: id, property_id: propertyId };
+    if (page_size) params.page_size = page_size;
+    if (start_cursor) params.start_cursor = start_cursor;
+    const response = await this.client.pages.properties.retrieve(params);
+    return response;
+  }
+
+  // ============================================================
+  // MOVE PAGE
+  // ============================================================
+
+  async movePage(pageId, newParentId, isDatabase = false) {
+    this.init();
+    const id = this._cleanId(pageId);
+    const parentId = this._cleanId(newParentId);
+    const parent = isDatabase ? { database_id: parentId } : { page_id: parentId };
+    // Notion API doesn't support moving pages directly via PATCH
+    // We can only update the parent if the page was created under a database
+    // For general moves, we need to create a copy and archive the original
+    // However, the Notion API does support updating parent for database pages
+    const page = await this.client.pages.update({ page_id: id, ...{ parent } });
+    return { id: page.id, url: page.url };
+  }
+
+  // ============================================================
+  // DUPLICATE PAGE
+  // ============================================================
+
+  async duplicatePage(sourcePageId, newParentId, newTitle) {
+    this.init();
+    const source = await this.fetchPage(sourcePageId);
+
+    // Build properties for new page
+    let properties = {};
+    if (newTitle) {
+      properties = { title: { title: [{ type: 'text', text: { content: newTitle } }] } };
+    }
+
+    // Determine parent
+    const parent = source.parent;
+    let parentId = newParentId;
+    let isDatabase = false;
+    if (!parentId) {
+      if (parent.database_id) { parentId = parent.database_id; isDatabase = true; }
+      else if (parent.page_id) { parentId = parent.page_id; }
+      else { throw new Error('Cannot determine parent for duplication'); }
+    }
+
+    // Convert content back to blocks
+    const blocks = markdownToBlocks(source.content || '');
+
+    return this.createPage(parentId, {
+      properties: Object.keys(properties).length > 0 ? properties : undefined,
+      content: blocks.length > 0 ? blocks : undefined,
+      icon: source.icon,
+      cover: source.cover,
+      is_database: isDatabase,
+    });
   }
 
   // ============================================================

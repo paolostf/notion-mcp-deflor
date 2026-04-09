@@ -1,5 +1,5 @@
 // server.js — MCP tool definitions for Notion DeFlorance
-// Factory function that creates and configures the MCP server with all tools
+// 26 tools covering: search, pages, databases, blocks, comments, users, batch ops
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -9,11 +9,11 @@ import { markdownToBlocks, buildPropertyValue } from './blocks.js';
 export function createServer() {
   const server = new McpServer({
     name: 'notion-mcp-deflor',
-    version: '1.0.0',
+    version: '2.0.0',
   });
 
   // ============================================================
-  // SEARCH — Find pages and databases across the workspace
+  // 1. SEARCH
   // ============================================================
 
   server.tool(
@@ -23,7 +23,7 @@ export function createServer() {
       query: z.string().describe('Search query text — matches against page/database titles'),
       filter_type: z.enum(['page', 'database']).optional().describe('Restrict results to pages or databases only'),
       sort_direction: z.enum(['ascending', 'descending']).optional().describe('Sort by last_edited_time'),
-      page_size: z.number().min(1).max(100).optional().describe('Number of results to return (default 10, max 100)'),
+      page_size: z.number().min(1).max(100).optional().describe('Number of results (default 10, max 100)'),
     },
     async ({ query, filter_type, sort_direction, page_size }) => {
       const result = await notionClient.search(query, { filter_type, sort_direction, page_size });
@@ -32,12 +32,12 @@ export function createServer() {
   );
 
   // ============================================================
-  // FETCH PAGE — Full page content as Markdown
+  // 2. FETCH PAGE
   // ============================================================
 
   server.tool(
     'fetch_page',
-    'Retrieve a Notion page with full content converted to Markdown. Accepts a page ID or full Notion URL. Returns title, properties (formatted as key-value pairs), and the complete page body as Markdown including headings, lists, tables, code blocks, images, toggles, callouts, and nested content up to 3 levels deep. This is the primary tool for reading page content.',
+    'Retrieve a Notion page with full content converted to Markdown. Accepts a page ID or full Notion URL. Returns title, properties (formatted key-value), and the complete page body as Markdown including headings, lists, tables, code blocks, images, toggles, callouts, and nested content up to 3 levels deep.',
     {
       page_id: z.string().describe('Notion page ID (UUID with or without dashes) or full Notion URL'),
     },
@@ -53,7 +53,6 @@ export function createServer() {
       lines.push(`Last edited: ${page.last_edited_time}`);
       lines.push('');
 
-      // Properties section
       const propEntries = Object.entries(page.properties || {});
       if (propEntries.length > 0) {
         lines.push('## Properties');
@@ -65,7 +64,6 @@ export function createServer() {
         lines.push('');
       }
 
-      // Content section
       if (page.content) {
         lines.push('## Content');
         lines.push('');
@@ -77,12 +75,161 @@ export function createServer() {
   );
 
   // ============================================================
-  // FETCH DATABASE — Schema and metadata
+  // 3. CREATE PAGE
+  // ============================================================
+
+  server.tool(
+    'create_page',
+    'Create a new Notion page inside a database or under a parent page. Supports properties (Notion API format), Markdown content (auto-converted to blocks), icon (emoji or URL), and cover image. For database pages, set is_database=true.',
+    {
+      parent_id: z.string().describe('Parent page ID or database ID (UUID or Notion URL)'),
+      is_database: z.boolean().optional().describe('True if parent_id is a database (default false)'),
+      title: z.string().optional().describe('Page title shorthand — auto-sets the title property'),
+      properties: z.record(z.any()).optional().describe('Notion API properties object. Example: {"Name": {"title": [{"text": {"content": "My Page"}}]}, "Status": {"select": {"name": "Active"}}}'),
+      content_markdown: z.string().optional().describe('Page body in Markdown. Supports: # headings, - lists, 1. numbered, - [x] todos, > quotes, ```code```, ---, **bold**, *italic*, [links](url)'),
+      icon: z.string().optional().describe('Emoji character or external image URL'),
+      cover: z.string().optional().describe('Cover image URL'),
+    },
+    async ({ parent_id, is_database, title, properties, content_markdown, icon, cover }) => {
+      let props = properties || {};
+      if (title && !properties) {
+        props = { title: { title: [{ type: 'text', text: { content: title } }] } };
+      } else if (title && properties && !properties.title && !properties.Name) {
+        props.title = { title: [{ type: 'text', text: { content: title } }] };
+      }
+
+      const content = content_markdown ? markdownToBlocks(content_markdown) : undefined;
+
+      const result = await notionClient.createPage(parent_id, {
+        properties: props,
+        content,
+        icon,
+        cover,
+        is_database,
+      });
+
+      return {
+        content: [{
+          type: 'text',
+          text: `Page created.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 4. UPDATE PAGE PROPERTIES
+  // ============================================================
+
+  server.tool(
+    'update_page_properties',
+    'Update properties on an existing Notion page or database row. Pass properties in Notion API format. Supports all property types: title, rich_text, number, select, multi_select, status, date, checkbox, url, email, phone_number, relation, people, files. Use build_property_value to construct values from simple inputs.',
+    {
+      page_id: z.string().describe('Notion page ID (UUID) or full Notion URL'),
+      properties: z.record(z.any()).describe('Properties to update. Example: {"Status": {"select": {"name": "Done"}}, "Priority": {"number": 1}}'),
+    },
+    async ({ page_id, properties }) => {
+      const result = await notionClient.updatePageProperties(page_id, properties);
+      return {
+        content: [{
+          type: 'text',
+          text: `Page updated.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 5. UPDATE PAGE CONTENT (oldStr/newStr diffing)
+  // ============================================================
+
+  server.tool(
+    'update_page_content',
+    'Update the content of a Notion page using oldStr/newStr replacement (like a text diff). Fetches all blocks as Markdown, performs the string replacement, and replaces all blocks with the modified content. If oldStr is omitted, performs a full content replacement. Supports multiple sequential updates in one call.',
+    {
+      page_id: z.string().describe('Notion page ID (UUID) or full Notion URL'),
+      updates: z.array(z.object({
+        oldStr: z.string().optional().describe('Text to find in the page Markdown. Omit for full content replacement.'),
+        newStr: z.string().describe('Replacement text (Markdown). If oldStr omitted, this replaces ALL page content.'),
+        replaceAllMatches: z.boolean().optional().describe('Replace all occurrences of oldStr (default: first only)'),
+      })).describe('Array of content updates to apply sequentially'),
+    },
+    async ({ page_id, updates }) => {
+      const result = await notionClient.updatePageContent(page_id, updates);
+      return {
+        content: [{
+          type: 'text',
+          text: `Page content updated.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 6. ARCHIVE PAGES
+  // ============================================================
+
+  server.tool(
+    'archive_pages',
+    'Archive (soft-delete) one or more Notion pages. Archived pages can be restored from Notion trash. Accepts an array of page IDs.',
+    {
+      page_ids: z.array(z.string()).describe('Array of page IDs (UUIDs) to archive'),
+    },
+    async ({ page_ids }) => {
+      const result = await notionClient.archivePages(page_ids);
+      return {
+        content: [{
+          type: 'text',
+          text: `Archived ${result.archived.length} page(s): ${result.archived.join(', ')}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 7. UNARCHIVE PAGES
+  // ============================================================
+
+  server.tool(
+    'unarchive_pages',
+    'Restore previously archived Notion pages from trash. Accepts an array of page IDs.',
+    {
+      page_ids: z.array(z.string()).describe('Array of page IDs (UUIDs) to unarchive'),
+    },
+    async ({ page_ids }) => {
+      const result = await notionClient.unarchivePages(page_ids);
+      return {
+        content: [{
+          type: 'text',
+          text: `Unarchived ${result.unarchived.length} page(s): ${result.unarchived.join(', ')}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 8. DELETE BLOCK
+  // ============================================================
+
+  server.tool(
+    'delete_block',
+    'Delete (archive) a specific block from a Notion page. Soft-deleted blocks can be recovered from trash.',
+    {
+      block_id: z.string().describe('Block ID to delete (UUID)'),
+    },
+    async ({ block_id }) => {
+      const result = await notionClient.deleteBlock(block_id);
+      return { content: [{ type: 'text', text: `Block deleted: ${result.deleted}` }] };
+    }
+  );
+
+  // ============================================================
+  // 9. FETCH DATABASE
   // ============================================================
 
   server.tool(
     'fetch_database',
-    'Retrieve a Notion database schema and metadata. Returns the database title, description, column definitions (property names, types, select/multi_select options, formula expressions, relation targets, rollup configs). Use this to understand a database structure before querying or creating pages in it.',
+    'Retrieve a Notion database schema and metadata. Returns title, description, column definitions (property names, types, select options, formula expressions, relation targets, rollup configs). Use this to understand database structure before querying or creating pages.',
     {
       database_id: z.string().describe('Notion database ID (UUID) or full Notion URL'),
     },
@@ -105,8 +252,8 @@ export function createServer() {
         if (def.options) desc += `: ${def.options.join(', ')}`;
         if (def.format) desc += ` [format: ${def.format}]`;
         if (def.expression) desc += ` [formula: ${def.expression}]`;
-        if (def.database_id) desc += ` [→ db: ${def.database_id}]`;
-        if (def.relation_property) desc += ` [rollup: ${def.relation_property} → ${def.rollup_property} (${def.function})]`;
+        if (def.database_id) desc += ` [-> db: ${def.database_id}]`;
+        if (def.relation_property) desc += ` [rollup: ${def.relation_property} -> ${def.rollup_property} (${def.function})]`;
         if (def.groups) desc += ` [groups: ${def.groups.map(g => g.name).join(', ')}]`;
         lines.push(desc);
       }
@@ -116,18 +263,18 @@ export function createServer() {
   );
 
   // ============================================================
-  // QUERY DATABASE — Filter and sort rows
+  // 10. QUERY DATABASE
   // ============================================================
 
   server.tool(
     'query_database',
-    'Query a Notion database with optional filters and sorts. Returns rows with their properties formatted as key-value pairs. Supports Notion API filter objects (e.g., {"property": "Status", "select": {"equals": "Done"}}) and sort objects (e.g., [{"property": "Date", "direction": "descending"}]). Filters and sorts can be passed as JSON strings or objects.',
+    'Query a Notion database with filters and sorts. Returns rows with properties as key-value pairs. Supports Notion API filter objects and sort arrays. Filters/sorts can be JSON strings or objects.',
     {
       database_id: z.string().describe('Notion database ID (UUID) or full Notion URL'),
-      filter: z.union([z.string(), z.record(z.any())]).optional().describe('Notion API filter object or JSON string. Example: {"property": "Status", "select": {"equals": "Active"}}'),
-      sorts: z.union([z.string(), z.array(z.any())]).optional().describe('Array of sort objects or JSON string. Example: [{"property": "Date", "direction": "descending"}]'),
-      page_size: z.number().min(1).max(100).optional().describe('Number of rows to return (default 20, max 100)'),
-      start_cursor: z.string().optional().describe('Pagination cursor from a previous query response'),
+      filter: z.union([z.string(), z.record(z.any())]).optional().describe('Notion filter object or JSON string. Example: {"property": "Status", "select": {"equals": "Active"}}'),
+      sorts: z.union([z.string(), z.array(z.any())]).optional().describe('Sort array or JSON string. Example: [{"property": "Date", "direction": "descending"}]'),
+      page_size: z.number().min(1).max(100).optional().describe('Rows to return (default 20, max 100)'),
+      start_cursor: z.string().optional().describe('Pagination cursor from previous query'),
     },
     async ({ database_id, filter, sorts, page_size, start_cursor }) => {
       const result = await notionClient.queryDatabase(database_id, { filter, sorts, page_size, start_cursor });
@@ -151,85 +298,156 @@ export function createServer() {
   );
 
   // ============================================================
-  // CREATE PAGE — With properties and Markdown content
+  // 11. CREATE DATABASE
   // ============================================================
 
   server.tool(
-    'create_page',
-    'Create a new Notion page inside a database or under a parent page. Supports setting properties (as Notion API property values), page content (as Markdown which gets converted to Notion blocks), icon (emoji or URL), and cover image. For database pages, set is_database=true and pass the database ID as parent_id. Content written in Markdown is automatically converted to Notion blocks including headings, lists, code blocks, quotes, to-dos, and dividers.',
+    'create_database',
+    'Create a new Notion database as a child of a page. Define schema with property definitions. At minimum include a title property: {"Name": {"title": {}}}. Supports all property types.',
     {
-      parent_id: z.string().describe('Parent page ID or database ID (UUID or Notion URL)'),
-      is_database: z.boolean().optional().describe('Set true if parent_id is a database (default false = parent page)'),
-      title: z.string().optional().describe('Page title — shorthand that sets the title property automatically'),
-      properties: z.record(z.any()).optional().describe('Notion API properties object. For databases, must match the schema. Example: {"Name": {"title": [{"text": {"content": "My Page"}}]}, "Status": {"select": {"name": "Active"}}}'),
-      content_markdown: z.string().optional().describe('Page body content in Markdown. Converted to Notion blocks. Supports: # headings, - lists, 1. numbered, - [x] todos, > quotes, ```code```, ---, **bold**, *italic*, [links](url)'),
-      icon: z.string().optional().describe('Page icon — emoji character (e.g., "🚀") or external image URL'),
-      cover: z.string().optional().describe('Cover image URL'),
+      parent_page_id: z.string().describe('Parent page ID (UUID or Notion URL)'),
+      title: z.string().describe('Database title'),
+      properties: z.record(z.any()).optional().describe('Schema — property name to type definition. Default: {"Name": {"title": {}}}'),
+      icon: z.string().optional().describe('Emoji or URL'),
+      description: z.string().optional().describe('Database description'),
     },
-    async ({ parent_id, is_database, title, properties, content_markdown, icon, cover }) => {
-      // Build properties — if title provided as shorthand, inject it
-      let props = properties || {};
-      if (title && !properties) {
-        props = { title: { title: [{ type: 'text', text: { content: title } }] } };
-      } else if (title && properties && !properties.title && !properties.Name) {
-        // Find the title property name from the provided properties, or default
-        props.title = { title: [{ type: 'text', text: { content: title } }] };
-      }
-
-      // Convert Markdown to Notion blocks
-      const content = content_markdown ? markdownToBlocks(content_markdown) : undefined;
-
-      const result = await notionClient.createPage(parent_id, {
-        properties: props,
-        content,
-        icon,
-        cover,
-        is_database,
-      });
-
+    async ({ parent_page_id, title, properties, icon, description }) => {
+      const result = await notionClient.createDatabase(parent_page_id, { title, properties, icon, description });
       return {
         content: [{
           type: 'text',
-          text: `Page created successfully.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
+          text: `Database created.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
         }],
       };
     }
   );
 
   // ============================================================
-  // UPDATE PAGE PROPERTIES
+  // 12. UPDATE DATABASE
   // ============================================================
 
   server.tool(
-    'update_page_properties',
-    'Update properties on an existing Notion page. Pass a properties object matching the Notion API format. To update a database row, use the row\'s page ID. Supports all property types: title, rich_text, number, select, multi_select, status, date, checkbox, url, email, phone_number, relation, people, files. Use build_property_value tool to construct property values from simple inputs if needed.',
+    'update_database',
+    'Update a Notion database title, description, or schema. Add new properties, rename existing ones, or change types/options. Properties not included are left unchanged.',
+    {
+      database_id: z.string().describe('Notion database ID (UUID) or full Notion URL'),
+      title: z.string().optional().describe('New title'),
+      properties: z.record(z.any()).optional().describe('Schema updates — properties to add or modify'),
+      description: z.string().optional().describe('New description'),
+    },
+    async ({ database_id, title, properties, description }) => {
+      const result = await notionClient.updateDatabase(database_id, { title, properties, description });
+      return {
+        content: [{
+          type: 'text',
+          text: `Database updated.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 13. DELETE DATABASES
+  // ============================================================
+
+  server.tool(
+    'delete_databases',
+    'Archive (soft-delete) one or more Notion databases. Databases are pages internally, so this archives them. Recoverable from trash.',
+    {
+      database_ids: z.array(z.string()).describe('Array of database IDs (UUIDs) to archive'),
+    },
+    async ({ database_ids }) => {
+      const result = await notionClient.deleteDatabases(database_ids);
+      return {
+        content: [{
+          type: 'text',
+          text: `Archived ${result.archived.length} database(s): ${result.archived.join(', ')}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 14. CREATE TWO-WAY RELATION
+  // ============================================================
+
+  server.tool(
+    'create_two_way_relation',
+    'Create a bidirectional (two-way) relation between two Notion databases. Creates a relation property on the source database that auto-creates a synced property on the target database.',
+    {
+      source_database_id: z.string().describe('Source database ID (UUID)'),
+      target_database_id: z.string().describe('Target database ID (UUID)'),
+      source_property_name: z.string().describe('Name for the relation column in the source database'),
+      target_property_name: z.string().describe('Name for the synced relation column in the target database'),
+    },
+    async ({ source_database_id, target_database_id, source_property_name, target_property_name }) => {
+      const result = await notionClient.createTwoWayRelation(source_database_id, target_database_id, source_property_name, target_property_name);
+      return {
+        content: [{
+          type: 'text',
+          text: `Two-way relation created.\nSource DB: ${result.source_database_id} (property: ${result.source_property})\nTarget DB: ${result.target_database_id} (property: ${result.target_property})`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 15. GET PAGE PROPERTY (paginated)
+  // ============================================================
+
+  server.tool(
+    'get_page_property',
+    'Retrieve a specific property value from a Notion page with pagination support. Use this for large property values (rich_text, relation, rollup, people) that may be paginated. Returns the raw Notion API property response.',
+    {
+      page_id: z.string().describe('Notion page ID (UUID) or Notion URL'),
+      property_id: z.string().describe('Property ID (from page properties metadata, not the property name)'),
+      page_size: z.number().optional().describe('Results per page'),
+      start_cursor: z.string().optional().describe('Pagination cursor'),
+    },
+    async ({ page_id, property_id, page_size, start_cursor }) => {
+      const result = await notionClient.getPageProperty(page_id, property_id, { page_size, start_cursor });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ============================================================
+  // 16. APPEND CONTENT
+  // ============================================================
+
+  server.tool(
+    'append_content',
+    'Append Markdown content as blocks to the end of a Notion page. Does not replace existing content. Handles >100 blocks by chunking automatically.',
     {
       page_id: z.string().describe('Notion page ID (UUID) or full Notion URL'),
-      properties: z.record(z.any()).describe('Properties to update in Notion API format. Example: {"Status": {"select": {"name": "Done"}}, "Priority": {"number": 1}}'),
+      content_markdown: z.string().describe('Markdown to append. Supports: # headings, - lists, 1. numbered, - [x] todos, > quotes, ```code```, ---, **bold**, *italic*, [links](url)'),
     },
-    async ({ page_id, properties }) => {
-      const result = await notionClient.updatePageProperties(page_id, properties);
+    async ({ page_id, content_markdown }) => {
+      const blocks = markdownToBlocks(content_markdown);
+      if (blocks.length === 0) {
+        return { content: [{ type: 'text', text: 'No content to append — markdown produced zero blocks.' }] };
+      }
+      const result = await notionClient.appendContent(page_id, blocks);
       return {
         content: [{
           type: 'text',
-          text: `Page updated.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
+          text: `Appended ${result.appended} blocks to page.`,
         }],
       };
     }
   );
 
   // ============================================================
-  // BUILD PROPERTY VALUE — Helper for constructing property values
+  // 17. BUILD PROPERTY VALUE (helper)
   // ============================================================
 
   server.tool(
     'build_property_value',
-    'Helper tool that converts simple values into Notion API property format. Use this when you need to construct property values for create_page or update_page_properties but don\'t want to manually build the nested Notion API structure. Supports: title, rich_text, number, select, multi_select, status, date, checkbox, url, email, phone_number, relation, people, files.',
+    'Convert simple values into Notion API property format. Use when constructing property values for create_page or update_page_properties without manually building nested structures. Supports: title, rich_text, number, select, multi_select, status, date, checkbox, url, email, phone_number, relation, people, files.',
     {
       properties: z.record(z.object({
         type: z.string().describe('Property type: title, rich_text, number, select, multi_select, status, date, checkbox, url, email, phone_number, relation, people, files'),
-        value: z.any().describe('Simple value to convert. Strings for most types, number for number, boolean for checkbox, array of IDs for relation/people, array of URLs for files, {start, end} for date ranges'),
-      })).describe('Map of property name → {type, value} pairs to convert'),
+        value: z.any().describe('Simple value. Strings for most types, number for number, boolean for checkbox, array of IDs for relation/people, array of URLs for files, {start, end} for date ranges'),
+      })).describe('Map of property name -> {type, value} pairs'),
     },
     async ({ properties }) => {
       const built = {};
@@ -246,105 +464,43 @@ export function createServer() {
   );
 
   // ============================================================
-  // APPEND CONTENT — Add blocks to an existing page
+  // 18. FETCH BLOCK CHILDREN
   // ============================================================
 
   server.tool(
-    'append_content',
-    'Append content blocks to the end of an existing Notion page. Content is written in Markdown and automatically converted to Notion blocks. Use this to add new sections, paragraphs, lists, code blocks, or other content to a page without replacing existing content. Handles pages with >100 blocks by chunking automatically.',
+    'fetch_block_children',
+    'List child blocks of a Notion block or page. Returns raw block objects with type, content, and metadata. Use for inspecting page structure at the block level. Supports pagination.',
     {
-      page_id: z.string().describe('Notion page ID (UUID) or full Notion URL'),
-      content_markdown: z.string().describe('Markdown content to append. Supports: # headings, - bullet lists, 1. numbered lists, - [x] todos, > quotes, ```code blocks```, ---, **bold**, *italic*, [links](url)'),
+      block_id: z.string().describe('Block or page ID (UUID)'),
+      page_size: z.number().min(1).max(100).optional().describe('Results per page (default 100)'),
+      start_cursor: z.string().optional().describe('Pagination cursor'),
     },
-    async ({ page_id, content_markdown }) => {
-      const blocks = markdownToBlocks(content_markdown);
-      if (blocks.length === 0) {
-        return { content: [{ type: 'text', text: 'No content to append — the markdown produced zero blocks.' }] };
-      }
-      const result = await notionClient.appendContent(page_id, blocks);
-      return {
-        content: [{
-          type: 'text',
-          text: `Appended ${result.appended} blocks to page.`,
-        }],
+    async ({ block_id, page_size, start_cursor }) => {
+      const result = await notionClient.fetchBlockChildren(block_id, { page_size, start_cursor });
+      const summary = result.results.map(b => ({
+        id: b.id,
+        type: b.type,
+        has_children: b.has_children,
+        content: b[b.type]?.rich_text?.map(rt => rt.plain_text).join('') || '',
+      }));
+      const out = {
+        blocks: summary,
+        has_more: result.has_more,
+        next_cursor: result.next_cursor,
       };
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
     }
   );
 
   // ============================================================
-  // DELETE BLOCK — Archive a block
-  // ============================================================
-
-  server.tool(
-    'delete_block',
-    'Delete (archive) a specific block from a Notion page. The block is soft-deleted and can be recovered from Notion\'s trash. Use this to remove paragraphs, list items, headings, or any other block element from a page.',
-    {
-      block_id: z.string().describe('Block ID to delete (UUID)'),
-    },
-    async ({ block_id }) => {
-      const result = await notionClient.deleteBlock(block_id);
-      return { content: [{ type: 'text', text: `Block deleted: ${result.deleted}` }] };
-    }
-  );
-
-  // ============================================================
-  // CREATE DATABASE — New database under a parent page
-  // ============================================================
-
-  server.tool(
-    'create_database',
-    'Create a new Notion database as a child of an existing page. Define the schema with property definitions matching the Notion API format. At minimum, include a title property (e.g., {"Name": {"title": {}}}). Supports all property types: title, rich_text, number, select, multi_select, status, date, checkbox, url, email, phone_number, formula, relation, rollup, files, people, created_time, last_edited_time.',
-    {
-      parent_page_id: z.string().describe('Parent page ID (UUID or Notion URL) where the database will be created'),
-      title: z.string().describe('Database title'),
-      properties: z.record(z.any()).optional().describe('Database schema — map of property name to type definition. Default: {"Name": {"title": {}}}. Example: {"Name": {"title": {}}, "Status": {"select": {"options": [{"name": "To Do"}, {"name": "Done"}]}}, "Priority": {"number": {"format": "number"}}}'),
-      icon: z.string().optional().describe('Database icon — emoji or URL'),
-      description: z.string().optional().describe('Database description text'),
-    },
-    async ({ parent_page_id, title, properties, icon, description }) => {
-      const result = await notionClient.createDatabase(parent_page_id, { title, properties, icon, description });
-      return {
-        content: [{
-          type: 'text',
-          text: `Database created.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
-        }],
-      };
-    }
-  );
-
-  // ============================================================
-  // UPDATE DATABASE — Modify schema/title/description
-  // ============================================================
-
-  server.tool(
-    'update_database',
-    'Update an existing Notion database. Can modify the title, description, and schema (add new properties, rename existing ones, change property types or options). To add a new column, include it in properties. To rename, use the Notion API rename syntax. Existing properties not included in the update are left unchanged.',
-    {
-      database_id: z.string().describe('Notion database ID (UUID) or full Notion URL'),
-      title: z.string().optional().describe('New database title'),
-      properties: z.record(z.any()).optional().describe('Schema updates — property definitions to add or modify'),
-      description: z.string().optional().describe('New database description'),
-    },
-    async ({ database_id, title, properties, description }) => {
-      const result = await notionClient.updateDatabase(database_id, { title, properties, description });
-      return {
-        content: [{
-          type: 'text',
-          text: `Database updated.\nID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
-        }],
-      };
-    }
-  );
-
-  // ============================================================
-  // GET COMMENTS — List comments on a page
+  // 19. GET COMMENTS
   // ============================================================
 
   server.tool(
     'get_comments',
-    'Retrieve all comments on a Notion page or block. Returns comment text, author, timestamp, and discussion thread IDs. Use discussion_id with create_comment to reply to specific threads.',
+    'List all comments on a Notion page or block. Returns comment text, author, timestamp, and discussion thread IDs. Use discussion_id with create_comment to reply to threads.',
     {
-      page_id: z.string().describe('Notion page or block ID (UUID) or full Notion URL'),
+      page_id: z.string().describe('Notion page or block ID (UUID) or Notion URL'),
     },
     async ({ page_id }) => {
       const comments = await notionClient.getComments(page_id);
@@ -359,16 +515,16 @@ export function createServer() {
   );
 
   // ============================================================
-  // CREATE COMMENT — Add a comment to a page or reply to thread
+  // 20. CREATE COMMENT
   // ============================================================
 
   server.tool(
     'create_comment',
-    'Add a comment to a Notion page or reply to an existing discussion thread. For page-level comments, provide page_id. For thread replies, provide discussion_id (from get_comments output). Comments appear in the page\'s comment section.',
+    'Add a comment to a Notion page or reply to an existing discussion thread. For page-level comments, provide page_id. For thread replies, provide discussion_id.',
     {
-      page_id: z.string().describe('Notion page ID (UUID) or full Notion URL'),
-      text: z.string().describe('Comment text content'),
-      discussion_id: z.string().optional().describe('Discussion thread ID to reply to (from get_comments). Omit for a new top-level comment.'),
+      page_id: z.string().describe('Notion page ID (UUID) or Notion URL'),
+      text: z.string().describe('Comment text'),
+      discussion_id: z.string().optional().describe('Discussion thread ID to reply to (from get_comments). Omit for new top-level comment.'),
     },
     async ({ page_id, text, discussion_id }) => {
       const result = await notionClient.createComment(page_id, text, discussion_id);
@@ -382,14 +538,14 @@ export function createServer() {
   );
 
   // ============================================================
-  // GET USERS — List workspace users
+  // 21. GET USERS
   // ============================================================
 
   server.tool(
     'get_users',
-    'List all users in the Notion workspace. Returns user IDs, names, emails, types (person/bot), and avatar URLs. Use this to find user IDs for people properties, created_by filters, or to understand workspace membership.',
+    'List all users in the Notion workspace. Returns IDs, names, emails, types (person/bot), and avatars.',
     {
-      page_size: z.number().min(1).max(100).optional().describe('Number of users to return (default 100)'),
+      page_size: z.number().min(1).max(100).optional().describe('Number of users (default 100)'),
     },
     async ({ page_size }) => {
       const users = await notionClient.getUsers(page_size);
@@ -397,6 +553,121 @@ export function createServer() {
         `${u.name} (${u.type}) — ID: ${u.id}${u.email ? ` — ${u.email}` : ''}`
       );
       return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
+  // ============================================================
+  // 22. GET USER
+  // ============================================================
+
+  server.tool(
+    'get_user',
+    'Retrieve details for a specific Notion user by ID. Returns name, type, email, and avatar.',
+    {
+      user_id: z.string().describe('Notion user ID (UUID)'),
+    },
+    async ({ user_id }) => {
+      const user = await notionClient.getUser(user_id);
+      return {
+        content: [{
+          type: 'text',
+          text: `${user.name} (${user.type})\nID: ${user.id}${user.email ? `\nEmail: ${user.email}` : ''}${user.avatar ? `\nAvatar: ${user.avatar}` : ''}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 23. BATCH GET PAGES
+  // ============================================================
+
+  server.tool(
+    'batch_get_pages',
+    'Fetch multiple Notion pages in one call. Returns each page with title, properties, and full Markdown content. More efficient than calling fetch_page multiple times.',
+    {
+      page_ids: z.array(z.string()).describe('Array of page IDs (UUIDs or Notion URLs)'),
+    },
+    async ({ page_ids }) => {
+      const results = [];
+      for (const pid of page_ids) {
+        try {
+          const page = await notionClient.fetchPage(pid);
+          results.push({ id: page.id, title: page.title, url: page.url, properties: page.properties, content: page.content });
+        } catch (e) {
+          results.push({ id: pid, error: e.message });
+        }
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+    }
+  );
+
+  // ============================================================
+  // 24. BATCH GET DATABASES
+  // ============================================================
+
+  server.tool(
+    'batch_get_databases',
+    'Fetch multiple Notion database schemas in one call. Returns each database with title, description, and full schema. More efficient than calling fetch_database multiple times.',
+    {
+      database_ids: z.array(z.string()).describe('Array of database IDs (UUIDs or Notion URLs)'),
+    },
+    async ({ database_ids }) => {
+      const results = [];
+      for (const did of database_ids) {
+        try {
+          const db = await notionClient.fetchDatabase(did);
+          results.push({ id: db.id, title: db.title, url: db.url, schema: db.schema });
+        } catch (e) {
+          results.push({ id: did, error: e.message });
+        }
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+    }
+  );
+
+  // ============================================================
+  // 25. MOVE PAGE
+  // ============================================================
+
+  server.tool(
+    'move_page',
+    'Move a Notion page to a new parent (page or database). Updates the parent reference. For database destinations, set is_database=true.',
+    {
+      page_id: z.string().describe('Page ID to move (UUID)'),
+      new_parent_id: z.string().describe('Destination parent ID (page or database UUID)'),
+      is_database: z.boolean().optional().describe('True if new parent is a database (default false)'),
+    },
+    async ({ page_id, new_parent_id, is_database }) => {
+      const result = await notionClient.movePage(page_id, new_parent_id, is_database);
+      return {
+        content: [{
+          type: 'text',
+          text: `Page moved.\nID: ${result.id}\nURL: ${result.url}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 26. DUPLICATE PAGE
+  // ============================================================
+
+  server.tool(
+    'duplicate_page',
+    'Duplicate a Notion page with all its content, icon, and cover. Creates a copy under the same parent or a specified new parent. Content is read as Markdown from the source and recreated as blocks in the copy.',
+    {
+      source_page_id: z.string().describe('Source page ID to duplicate (UUID or Notion URL)'),
+      new_parent_id: z.string().optional().describe('Optional new parent ID. If omitted, copy goes under the same parent as the source.'),
+      new_title: z.string().optional().describe('Title for the copy. If omitted, uses source title.'),
+    },
+    async ({ source_page_id, new_parent_id, new_title }) => {
+      const result = await notionClient.duplicatePage(source_page_id, new_parent_id, new_title);
+      return {
+        content: [{
+          type: 'text',
+          text: `Page duplicated.\nNew ID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
+        }],
+      };
     }
   );
 
