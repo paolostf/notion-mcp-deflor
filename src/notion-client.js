@@ -4,30 +4,57 @@
 import { Client } from '@notionhq/client';
 import { blocksToMarkdown, markdownToBlocks, formatProperties, formatDatabaseSchema } from './blocks.js';
 
+// Workspace registry — maps alias to env var name
+// Default workspace uses NOTION_TOKEN, extras use NOTION_TOKEN_{ALIAS}
+const WORKSPACE_REGISTRY = {
+  deflorance: 'NOTION_TOKEN',
+  paolo: 'NOTION_TOKEN_PAOLO',
+};
+
+const DEFAULT_WORKSPACE = 'deflorance';
+
 class NotionClient {
   constructor() {
-    this.initialized = false;
+    this.clients = {};  // workspace -> Client instance
   }
 
-  init() {
-    if (this.initialized) return;
-    const token = process.env.NOTION_TOKEN;
-    if (!token) throw new Error('NOTION_TOKEN env var required');
-    this.client = new Client({ auth: token });
-    this.initialized = true;
+  /** Get or create a Notion Client for the given workspace */
+  _getClient(workspace) {
+    const ws = (workspace || DEFAULT_WORKSPACE).toLowerCase();
+    if (this.clients[ws]) return this.clients[ws];
+
+    const envVar = WORKSPACE_REGISTRY[ws];
+    if (!envVar) {
+      const available = Object.keys(WORKSPACE_REGISTRY).join(', ');
+      throw new Error(`Unknown workspace "${ws}". Available: ${available}`);
+    }
+    const token = process.env[envVar];
+    if (!token) throw new Error(`${envVar} env var required for workspace "${ws}"`);
+
+    this.clients[ws] = new Client({ auth: token });
+    return this.clients[ws];
   }
+
+  /** @deprecated — backward compat, routes to default workspace */
+  init() {
+    this._getClient(DEFAULT_WORKSPACE);
+  }
+
+  /** Get the raw Notion SDK client for a workspace */
+  get client() { return this._getClient(DEFAULT_WORKSPACE); }
+  set client(_) { /* no-op for backward compat */ }
 
   // ============================================================
   // SEARCH
   // ============================================================
 
-  async search(query, { filter_type, sort_direction, page_size } = {}) {
-    this.init();
+  async search(query, { filter_type, sort_direction, page_size, workspace } = {}) {
+    const client = this._getClient(workspace);
     const params = { query, page_size: page_size || 10 };
     if (filter_type) params.filter = { property: 'object', value: filter_type };
     if (sort_direction) params.sort = { direction: sort_direction, timestamp: 'last_edited_time' };
 
-    const response = await this.client.search(params);
+    const response = await client.search(params);
     const results = response.results.map(r => {
       if (r.object === 'page') {
         const title = this._extractTitle(r);
@@ -59,13 +86,13 @@ class NotionClient {
   // FETCH PAGE (metadata + full content as Markdown)
   // ============================================================
 
-  async fetchPage(pageId) {
-    this.init();
+  async fetchPage(pageId, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
-    const page = await this.client.pages.retrieve({ page_id: id });
+    const page = await client.pages.retrieve({ page_id: id });
     const title = this._extractTitle(page);
     const properties = formatProperties(page.properties);
-    const blocks = await this._getAllBlocks(id);
+    const blocks = await this._getAllBlocks(id, 0, client);
     const content = blocksToMarkdown(blocks);
 
     return {
@@ -86,10 +113,10 @@ class NotionClient {
   // FETCH DATABASE (schema + views)
   // ============================================================
 
-  async fetchDatabase(databaseId) {
-    this.init();
+  async fetchDatabase(databaseId, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(databaseId);
-    const db = await this.client.databases.retrieve({ database_id: id });
+    const db = await client.databases.retrieve({ database_id: id });
     const title = db.title?.map(t => t.plain_text).join('') || 'Untitled';
     const schema = formatDatabaseSchema(db.properties);
 
@@ -110,15 +137,15 @@ class NotionClient {
   // QUERY DATABASE (with filters and sorts)
   // ============================================================
 
-  async queryDatabase(databaseId, { filter, sorts, page_size, start_cursor } = {}) {
-    this.init();
+  async queryDatabase(databaseId, { filter, sorts, page_size, start_cursor, workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(databaseId);
     const params = { database_id: id, page_size: page_size || 20 };
     if (filter) params.filter = typeof filter === 'string' ? JSON.parse(filter) : filter;
     if (sorts) params.sorts = typeof sorts === 'string' ? JSON.parse(sorts) : sorts;
     if (start_cursor) params.start_cursor = start_cursor;
 
-    const response = await this.client.databases.query(params);
+    const response = await client.databases.query(params);
     const results = response.results.map(page => ({
       id: page.id,
       url: page.url,
@@ -132,8 +159,8 @@ class NotionClient {
   // CREATE PAGE
   // ============================================================
 
-  async createPage(parentId, { properties, content, icon, cover, is_database } = {}) {
-    this.init();
+  async createPage(parentId, { properties, content, icon, cover, is_database, workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(parentId);
     const parent = is_database ? { database_id: id } : { page_id: id };
     const params = { parent };
@@ -152,12 +179,12 @@ class NotionClient {
     if (icon) params.icon = icon.startsWith('http') ? { type: 'external', external: { url: icon } } : { type: 'emoji', emoji: icon };
     if (cover) params.cover = { type: 'external', external: { url: cover } };
 
-    const page = await this.client.pages.create(params);
+    const page = await client.pages.create(params);
 
     // Append remaining blocks if > 100
     if (content && content.length > 100) {
       for (let i = 100; i < content.length; i += 100) {
-        await this.client.blocks.children.append({
+        await client.blocks.children.append({
           block_id: page.id,
           children: content.slice(i, i + 100),
         });
@@ -171,10 +198,10 @@ class NotionClient {
   // UPDATE PAGE PROPERTIES
   // ============================================================
 
-  async updatePageProperties(pageId, properties) {
-    this.init();
+  async updatePageProperties(pageId, properties, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
-    const page = await this.client.pages.update({ page_id: id, properties });
+    const page = await client.pages.update({ page_id: id, properties });
     return { id: page.id, url: page.url, title: this._extractTitle(page) };
   }
 
@@ -182,12 +209,12 @@ class NotionClient {
   // APPEND CONTENT (blocks) TO PAGE
   // ============================================================
 
-  async appendContent(pageId, blocks) {
-    this.init();
+  async appendContent(pageId, blocks, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
     const results = [];
     for (let i = 0; i < blocks.length; i += 100) {
-      const response = await this.client.blocks.children.append({
+      const response = await client.blocks.children.append({
         block_id: id,
         children: blocks.slice(i, i + 100),
       });
@@ -200,10 +227,10 @@ class NotionClient {
   // DELETE BLOCK
   // ============================================================
 
-  async deleteBlock(blockId) {
-    this.init();
+  async deleteBlock(blockId, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(blockId);
-    await this.client.blocks.update({ block_id: id, archived: true });
+    await client.blocks.update({ block_id: id, archived: true });
     return { deleted: id };
   }
 
@@ -211,8 +238,8 @@ class NotionClient {
   // CREATE DATABASE
   // ============================================================
 
-  async createDatabase(parentPageId, { title, properties, icon, description }) {
-    this.init();
+  async createDatabase(parentPageId, { title, properties, icon, description, workspace }) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(parentPageId);
     const params = {
       parent: { page_id: id },
@@ -222,7 +249,7 @@ class NotionClient {
     if (icon) params.icon = icon.startsWith('http') ? { type: 'external', external: { url: icon } } : { type: 'emoji', emoji: icon };
     if (description) params.description = [{ type: 'text', text: { content: description } }];
 
-    const db = await this.client.databases.create(params);
+    const db = await client.databases.create(params);
     return { id: db.id, url: db.url, title: db.title?.map(t => t.plain_text).join('') };
   }
 
@@ -230,15 +257,15 @@ class NotionClient {
   // UPDATE DATABASE SCHEMA
   // ============================================================
 
-  async updateDatabase(databaseId, { title, properties, description }) {
-    this.init();
+  async updateDatabase(databaseId, { title, properties, description, workspace }) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(databaseId);
     const params = { database_id: id };
     if (title) params.title = [{ type: 'text', text: { content: title } }];
     if (properties) params.properties = properties;
     if (description) params.description = [{ type: 'text', text: { content: description } }];
 
-    const db = await this.client.databases.update(params);
+    const db = await client.databases.update(params);
     return { id: db.id, url: db.url, title: db.title?.map(t => t.plain_text).join('') };
   }
 
@@ -246,10 +273,10 @@ class NotionClient {
   // COMMENTS
   // ============================================================
 
-  async getComments(pageId) {
-    this.init();
+  async getComments(pageId, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
-    const response = await this.client.comments.list({ block_id: id });
+    const response = await client.comments.list({ block_id: id });
     return response.results.map(c => ({
       id: c.id,
       created_time: c.created_time,
@@ -259,8 +286,8 @@ class NotionClient {
     }));
   }
 
-  async createComment(pageId, text, discussionId) {
-    this.init();
+  async createComment(pageId, text, discussionId, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
     const params = {
       rich_text: [{ type: 'text', text: { content: text } }],
@@ -270,7 +297,7 @@ class NotionClient {
     } else {
       params.parent = { page_id: id };
     }
-    const comment = await this.client.comments.create(params);
+    const comment = await client.comments.create(params);
     return { id: comment.id, created_time: comment.created_time };
   }
 
@@ -278,9 +305,9 @@ class NotionClient {
   // USERS
   // ============================================================
 
-  async getUsers(page_size) {
-    this.init();
-    const response = await this.client.users.list({ page_size: page_size || 100 });
+  async getUsers(page_size, { workspace } = {}) {
+    const client = this._getClient(workspace);
+    const response = await client.users.list({ page_size: page_size || 100 });
     return response.results.map(u => ({
       id: u.id,
       type: u.type,
@@ -290,9 +317,9 @@ class NotionClient {
     }));
   }
 
-  async getUser(userId) {
-    this.init();
-    const user = await this.client.users.retrieve({ user_id: userId });
+  async getUser(userId, { workspace } = {}) {
+    const client = this._getClient(workspace);
+    const user = await client.users.retrieve({ user_id: userId });
     return {
       id: user.id,
       type: user.type,
@@ -306,58 +333,58 @@ class NotionClient {
   // ARCHIVE / UNARCHIVE / DELETE PAGES
   // ============================================================
 
-  async archivePages(pageIds) {
-    this.init();
+  async archivePages(pageIds, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const results = [];
     for (const pid of pageIds) {
       const id = this._cleanId(pid);
-      await this.client.pages.update({ page_id: id, archived: true });
+      await client.pages.update({ page_id: id, archived: true });
       results.push(id);
     }
     return { archived: results };
   }
 
-  async unarchivePages(pageIds) {
-    this.init();
+  async unarchivePages(pageIds, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const results = [];
     for (const pid of pageIds) {
       const id = this._cleanId(pid);
-      await this.client.pages.update({ page_id: id, archived: false });
+      await client.pages.update({ page_id: id, archived: false });
       results.push(id);
     }
     return { unarchived: results };
   }
 
-  async deletePages(pageIds) {
-    return this.archivePages(pageIds);
+  async deletePages(pageIds, opts = {}) {
+    return this.archivePages(pageIds, opts);
   }
 
-  async deleteDatabases(databaseIds) {
-    return this.archivePages(databaseIds);
+  async deleteDatabases(databaseIds, opts = {}) {
+    return this.archivePages(databaseIds, opts);
   }
 
   // ============================================================
   // UPDATE PAGE CONTENT (oldStr/newStr diffing)
   // ============================================================
 
-  async updatePageContent(pageId, contentUpdates) {
-    this.init();
+  async updatePageContent(pageId, contentUpdates, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
 
     for (const update of contentUpdates) {
       if (!update.oldStr) {
         // Full replacement: delete all blocks, append new content
-        const existingBlocks = await this._getAllBlocks(id);
+        const existingBlocks = await this._getAllBlocks(id, 0, client);
         for (const block of existingBlocks) {
-          try { await this.client.blocks.update({ block_id: block.id, archived: true }); } catch (e) { /* skip undeletable */ }
+          try { await client.blocks.update({ block_id: block.id, archived: true }); } catch (e) { /* skip undeletable */ }
         }
         if (update.newStr) {
           const newBlocks = markdownToBlocks(update.newStr);
-          await this.appendContent(id, newBlocks);
+          await this.appendContent(id, newBlocks, { workspace });
         }
       } else {
         // Targeted replacement: find matching blocks, replace
-        const blocks = await this._getAllBlocks(id);
+        const blocks = await this._getAllBlocks(id, 0, client);
         const fullMarkdown = blocksToMarkdown(blocks);
 
         if (!fullMarkdown.includes(update.oldStr)) {
@@ -375,28 +402,28 @@ class NotionClient {
 
         // Delete all existing blocks and replace with new content
         for (const block of blocks) {
-          try { await this.client.blocks.update({ block_id: block.id, archived: true }); } catch (e) { /* skip */ }
+          try { await client.blocks.update({ block_id: block.id, archived: true }); } catch (e) { /* skip */ }
         }
         const newBlocks = markdownToBlocks(newMarkdown);
         if (newBlocks.length > 0) {
-          await this.appendContent(id, newBlocks);
+          await this.appendContent(id, newBlocks, { workspace });
         }
       }
     }
 
-    return this.fetchPage(pageId);
+    return this.fetchPage(pageId, { workspace });
   }
 
   // ============================================================
   // BLOCK OPERATIONS
   // ============================================================
 
-  async fetchBlockChildren(blockId, { page_size, start_cursor } = {}) {
-    this.init();
+  async fetchBlockChildren(blockId, { page_size, start_cursor, workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(blockId);
     const params = { block_id: id, page_size: page_size || 100 };
     if (start_cursor) params.start_cursor = start_cursor;
-    const response = await this.client.blocks.children.list(params);
+    const response = await client.blocks.children.list(params);
     return {
       results: response.results,
       has_more: response.has_more,
@@ -404,10 +431,10 @@ class NotionClient {
     };
   }
 
-  async updateBlock(blockId, data) {
-    this.init();
+  async updateBlock(blockId, data, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(blockId);
-    const block = await this.client.blocks.update({ block_id: id, ...data });
+    const block = await client.blocks.update({ block_id: id, ...data });
     return { id: block.id, type: block.type };
   }
 
@@ -415,8 +442,8 @@ class NotionClient {
   // TWO-WAY RELATION
   // ============================================================
 
-  async createTwoWayRelation(sourceDbId, targetDbId, sourcePropName, targetPropName) {
-    this.init();
+  async createTwoWayRelation(sourceDbId, targetDbId, sourcePropName, targetPropName, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const srcId = this._cleanId(sourceDbId);
     const tgtId = this._cleanId(targetDbId);
     const properties = {};
@@ -428,7 +455,7 @@ class NotionClient {
         dual_property: { synced_property_name: targetPropName },
       },
     };
-    const db = await this.client.databases.update({ database_id: srcId, properties });
+    const db = await client.databases.update({ database_id: srcId, properties });
     return {
       source_database_id: srcId,
       target_database_id: tgtId,
@@ -441,13 +468,13 @@ class NotionClient {
   // PAGE PROPERTY (paginated retrieval)
   // ============================================================
 
-  async getPageProperty(pageId, propertyId, { page_size, start_cursor } = {}) {
-    this.init();
+  async getPageProperty(pageId, propertyId, { page_size, start_cursor, workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
     const params = { page_id: id, property_id: propertyId };
     if (page_size) params.page_size = page_size;
     if (start_cursor) params.start_cursor = start_cursor;
-    const response = await this.client.pages.properties.retrieve(params);
+    const response = await client.pages.properties.retrieve(params);
     return response;
   }
 
@@ -455,16 +482,12 @@ class NotionClient {
   // MOVE PAGE
   // ============================================================
 
-  async movePage(pageId, newParentId, isDatabase = false) {
-    this.init();
+  async movePage(pageId, newParentId, isDatabase = false, { workspace } = {}) {
+    const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
     const parentId = this._cleanId(newParentId);
     const parent = isDatabase ? { database_id: parentId } : { page_id: parentId };
-    // Notion API doesn't support moving pages directly via PATCH
-    // We can only update the parent if the page was created under a database
-    // For general moves, we need to create a copy and archive the original
-    // However, the Notion API does support updating parent for database pages
-    const page = await this.client.pages.update({ page_id: id, ...{ parent } });
+    const page = await client.pages.update({ page_id: id, ...{ parent } });
     return { id: page.id, url: page.url };
   }
 
@@ -472,9 +495,8 @@ class NotionClient {
   // DUPLICATE PAGE
   // ============================================================
 
-  async duplicatePage(sourcePageId, newParentId, newTitle) {
-    this.init();
-    const source = await this.fetchPage(sourcePageId);
+  async duplicatePage(sourcePageId, newParentId, newTitle, { workspace } = {}) {
+    const source = await this.fetchPage(sourcePageId, { workspace });
 
     // Build properties for new page
     let properties = {};
@@ -501,6 +523,7 @@ class NotionClient {
       icon: source.icon,
       cover: source.cover,
       is_database: isDatabase,
+      workspace,
     });
   }
 
@@ -526,13 +549,14 @@ class NotionClient {
     return 'Untitled';
   }
 
-  async _getAllBlocks(blockId, depth = 0) {
+  async _getAllBlocks(blockId, depth = 0, client = null) {
     if (depth > 3) return []; // prevent infinite recursion, limit to 3 levels deep
+    const c = client || this._getClient(DEFAULT_WORKSPACE);
     const blocks = [];
     let cursor = undefined;
 
     do {
-      const response = await this.client.blocks.children.list({
+      const response = await c.blocks.children.list({
         block_id: blockId,
         start_cursor: cursor,
         page_size: 100,
@@ -540,7 +564,7 @@ class NotionClient {
 
       for (const block of response.results) {
         if (block.has_children) {
-          block.children = await this._getAllBlocks(block.id, depth + 1);
+          block.children = await this._getAllBlocks(block.id, depth + 1, c);
         }
         blocks.push(block);
       }

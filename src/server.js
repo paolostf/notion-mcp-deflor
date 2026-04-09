@@ -6,10 +6,12 @@ import { z } from 'zod';
 import { notionClient } from './notion-client.js';
 import { markdownToBlocks, buildPropertyValue } from './blocks.js';
 
+const WORKSPACE_ENUM = z.enum(['deflorance', 'paolo']).optional().describe('Workspace to operate on (default: deflorance)');
+
 export function createServer() {
   const server = new McpServer({
     name: 'notion-mcp-deflor',
-    version: '2.0.0',
+    version: '2.1.0',
   });
 
   // ============================================================
@@ -24,9 +26,10 @@ export function createServer() {
       filter_type: z.enum(['page', 'database']).optional().describe('Restrict results to pages or databases only'),
       sort_direction: z.enum(['ascending', 'descending']).optional().describe('Sort by last_edited_time'),
       page_size: z.number().min(1).max(100).optional().describe('Number of results (default 10, max 100)'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ query, filter_type, sort_direction, page_size }) => {
-      const result = await notionClient.search(query, { filter_type, sort_direction, page_size });
+    async ({ query, filter_type, sort_direction, page_size, workspace }) => {
+      const result = await notionClient.search(query, { filter_type, sort_direction, page_size, workspace });
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -40,9 +43,10 @@ export function createServer() {
     'Retrieve a Notion page with full content converted to Markdown. Accepts a page ID or full Notion URL. Returns title, properties (formatted key-value), and the complete page body as Markdown including headings, lists, tables, code blocks, images, toggles, callouts, and nested content up to 3 levels deep.',
     {
       page_id: z.string().describe('Notion page ID (UUID with or without dashes) or full Notion URL'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_id }) => {
-      const page = await notionClient.fetchPage(page_id);
+    async ({ page_id, workspace }) => {
+      const page = await notionClient.fetchPage(page_id, { workspace });
       const lines = [];
       lines.push(`# ${page.title}`);
       lines.push('');
@@ -89,8 +93,9 @@ export function createServer() {
       content_markdown: z.string().optional().describe('Page body in Markdown. Supports: # headings, - lists, 1. numbered, - [x] todos, > quotes, ```code```, ---, **bold**, *italic*, [links](url)'),
       icon: z.string().optional().describe('Emoji character or external image URL'),
       cover: z.string().optional().describe('Cover image URL'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ parent_id, is_database, title, properties, content_markdown, icon, cover }) => {
+    async ({ parent_id, is_database, title, properties, content_markdown, icon, cover, workspace }) => {
       let props = properties || {};
       if (title && !properties) {
         props = { title: { title: [{ type: 'text', text: { content: title } }] } };
@@ -106,6 +111,7 @@ export function createServer() {
         icon,
         cover,
         is_database,
+        workspace,
       });
 
       return {
@@ -127,9 +133,10 @@ export function createServer() {
     {
       page_id: z.string().describe('Notion page ID (UUID) or full Notion URL'),
       properties: z.record(z.any()).describe('Properties to update. Example: {"Status": {"select": {"name": "Done"}}, "Priority": {"number": 1}}'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_id, properties }) => {
-      const result = await notionClient.updatePageProperties(page_id, properties);
+    async ({ page_id, properties, workspace }) => {
+      const result = await notionClient.updatePageProperties(page_id, properties, { workspace });
       return {
         content: [{
           type: 'text',
@@ -153,9 +160,10 @@ export function createServer() {
         newStr: z.string().describe('Replacement text (Markdown). If oldStr omitted, this replaces ALL page content.'),
         replaceAllMatches: z.boolean().optional().describe('Replace all occurrences of oldStr (default: first only)'),
       })).describe('Array of content updates to apply sequentially'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_id, updates }) => {
-      const result = await notionClient.updatePageContent(page_id, updates);
+    async ({ page_id, updates, workspace }) => {
+      const result = await notionClient.updatePageContent(page_id, updates, { workspace });
       return {
         content: [{
           type: 'text',
@@ -174,9 +182,10 @@ export function createServer() {
     'Archive (soft-delete) one or more Notion pages. Archived pages can be restored from Notion trash. Accepts an array of page IDs.',
     {
       page_ids: z.array(z.string()).describe('Array of page IDs (UUIDs) to archive'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_ids }) => {
-      const result = await notionClient.archivePages(page_ids);
+    async ({ page_ids, workspace }) => {
+      const result = await notionClient.archivePages(page_ids, { workspace });
       return {
         content: [{
           type: 'text',
@@ -195,9 +204,10 @@ export function createServer() {
     'Restore previously archived Notion pages from trash. Accepts an array of page IDs.',
     {
       page_ids: z.array(z.string()).describe('Array of page IDs (UUIDs) to unarchive'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_ids }) => {
-      const result = await notionClient.unarchivePages(page_ids);
+    async ({ page_ids, workspace }) => {
+      const result = await notionClient.unarchivePages(page_ids, { workspace });
       return {
         content: [{
           type: 'text',
@@ -216,9 +226,10 @@ export function createServer() {
     'Delete (archive) a specific block from a Notion page. Soft-deleted blocks can be recovered from trash.',
     {
       block_id: z.string().describe('Block ID to delete (UUID)'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ block_id }) => {
-      const result = await notionClient.deleteBlock(block_id);
+    async ({ block_id, workspace }) => {
+      const result = await notionClient.deleteBlock(block_id, { workspace });
       return { content: [{ type: 'text', text: `Block deleted: ${result.deleted}` }] };
     }
   );
@@ -232,9 +243,10 @@ export function createServer() {
     'Retrieve a Notion database schema and metadata. Returns title, description, column definitions (property names, types, select options, formula expressions, relation targets, rollup configs). Use this to understand database structure before querying or creating pages.',
     {
       database_id: z.string().describe('Notion database ID (UUID) or full Notion URL'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ database_id }) => {
-      const db = await notionClient.fetchDatabase(database_id);
+    async ({ database_id, workspace }) => {
+      const db = await notionClient.fetchDatabase(database_id, { workspace });
       const lines = [];
       lines.push(`# Database: ${db.title}`);
       lines.push('');
@@ -275,9 +287,10 @@ export function createServer() {
       sorts: z.union([z.string(), z.array(z.any())]).optional().describe('Sort array or JSON string. Example: [{"property": "Date", "direction": "descending"}]'),
       page_size: z.number().min(1).max(100).optional().describe('Rows to return (default 20, max 100)'),
       start_cursor: z.string().optional().describe('Pagination cursor from previous query'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ database_id, filter, sorts, page_size, start_cursor }) => {
-      const result = await notionClient.queryDatabase(database_id, { filter, sorts, page_size, start_cursor });
+    async ({ database_id, filter, sorts, page_size, start_cursor, workspace }) => {
+      const result = await notionClient.queryDatabase(database_id, { filter, sorts, page_size, start_cursor, workspace });
 
       const lines = [];
       lines.push(`Results: ${result.results.length} rows${result.has_more ? ` (more available, cursor: ${result.next_cursor})` : ''}`);
@@ -310,9 +323,10 @@ export function createServer() {
       properties: z.record(z.any()).optional().describe('Schema — property name to type definition. Default: {"Name": {"title": {}}}'),
       icon: z.string().optional().describe('Emoji or URL'),
       description: z.string().optional().describe('Database description'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ parent_page_id, title, properties, icon, description }) => {
-      const result = await notionClient.createDatabase(parent_page_id, { title, properties, icon, description });
+    async ({ parent_page_id, title, properties, icon, description, workspace }) => {
+      const result = await notionClient.createDatabase(parent_page_id, { title, properties, icon, description, workspace });
       return {
         content: [{
           type: 'text',
@@ -334,9 +348,10 @@ export function createServer() {
       title: z.string().optional().describe('New title'),
       properties: z.record(z.any()).optional().describe('Schema updates — properties to add or modify'),
       description: z.string().optional().describe('New description'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ database_id, title, properties, description }) => {
-      const result = await notionClient.updateDatabase(database_id, { title, properties, description });
+    async ({ database_id, title, properties, description, workspace }) => {
+      const result = await notionClient.updateDatabase(database_id, { title, properties, description, workspace });
       return {
         content: [{
           type: 'text',
@@ -355,9 +370,10 @@ export function createServer() {
     'Archive (soft-delete) one or more Notion databases. Databases are pages internally, so this archives them. Recoverable from trash.',
     {
       database_ids: z.array(z.string()).describe('Array of database IDs (UUIDs) to archive'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ database_ids }) => {
-      const result = await notionClient.deleteDatabases(database_ids);
+    async ({ database_ids, workspace }) => {
+      const result = await notionClient.deleteDatabases(database_ids, { workspace });
       return {
         content: [{
           type: 'text',
@@ -379,9 +395,10 @@ export function createServer() {
       target_database_id: z.string().describe('Target database ID (UUID)'),
       source_property_name: z.string().describe('Name for the relation column in the source database'),
       target_property_name: z.string().describe('Name for the synced relation column in the target database'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ source_database_id, target_database_id, source_property_name, target_property_name }) => {
-      const result = await notionClient.createTwoWayRelation(source_database_id, target_database_id, source_property_name, target_property_name);
+    async ({ source_database_id, target_database_id, source_property_name, target_property_name, workspace }) => {
+      const result = await notionClient.createTwoWayRelation(source_database_id, target_database_id, source_property_name, target_property_name, { workspace });
       return {
         content: [{
           type: 'text',
@@ -403,9 +420,10 @@ export function createServer() {
       property_id: z.string().describe('Property ID (from page properties metadata, not the property name)'),
       page_size: z.number().optional().describe('Results per page'),
       start_cursor: z.string().optional().describe('Pagination cursor'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_id, property_id, page_size, start_cursor }) => {
-      const result = await notionClient.getPageProperty(page_id, property_id, { page_size, start_cursor });
+    async ({ page_id, property_id, page_size, start_cursor, workspace }) => {
+      const result = await notionClient.getPageProperty(page_id, property_id, { page_size, start_cursor, workspace });
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -420,13 +438,14 @@ export function createServer() {
     {
       page_id: z.string().describe('Notion page ID (UUID) or full Notion URL'),
       content_markdown: z.string().describe('Markdown to append. Supports: # headings, - lists, 1. numbered, - [x] todos, > quotes, ```code```, ---, **bold**, *italic*, [links](url)'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_id, content_markdown }) => {
+    async ({ page_id, content_markdown, workspace }) => {
       const blocks = markdownToBlocks(content_markdown);
       if (blocks.length === 0) {
         return { content: [{ type: 'text', text: 'No content to append — markdown produced zero blocks.' }] };
       }
-      const result = await notionClient.appendContent(page_id, blocks);
+      const result = await notionClient.appendContent(page_id, blocks, { workspace });
       return {
         content: [{
           type: 'text',
@@ -437,7 +456,7 @@ export function createServer() {
   );
 
   // ============================================================
-  // 17. BUILD PROPERTY VALUE (helper)
+  // 17. BUILD PROPERTY VALUE (helper — workspace-agnostic)
   // ============================================================
 
   server.tool(
@@ -474,9 +493,10 @@ export function createServer() {
       block_id: z.string().describe('Block or page ID (UUID)'),
       page_size: z.number().min(1).max(100).optional().describe('Results per page (default 100)'),
       start_cursor: z.string().optional().describe('Pagination cursor'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ block_id, page_size, start_cursor }) => {
-      const result = await notionClient.fetchBlockChildren(block_id, { page_size, start_cursor });
+    async ({ block_id, page_size, start_cursor, workspace }) => {
+      const result = await notionClient.fetchBlockChildren(block_id, { page_size, start_cursor, workspace });
       const summary = result.results.map(b => ({
         id: b.id,
         type: b.type,
@@ -501,9 +521,10 @@ export function createServer() {
     'List all comments on a Notion page or block. Returns comment text, author, timestamp, and discussion thread IDs. Use discussion_id with create_comment to reply to threads.',
     {
       page_id: z.string().describe('Notion page or block ID (UUID) or Notion URL'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_id }) => {
-      const comments = await notionClient.getComments(page_id);
+    async ({ page_id, workspace }) => {
+      const comments = await notionClient.getComments(page_id, { workspace });
       if (comments.length === 0) {
         return { content: [{ type: 'text', text: 'No comments on this page.' }] };
       }
@@ -525,9 +546,10 @@ export function createServer() {
       page_id: z.string().describe('Notion page ID (UUID) or Notion URL'),
       text: z.string().describe('Comment text'),
       discussion_id: z.string().optional().describe('Discussion thread ID to reply to (from get_comments). Omit for new top-level comment.'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_id, text, discussion_id }) => {
-      const result = await notionClient.createComment(page_id, text, discussion_id);
+    async ({ page_id, text, discussion_id, workspace }) => {
+      const result = await notionClient.createComment(page_id, text, discussion_id, { workspace });
       return {
         content: [{
           type: 'text',
@@ -546,9 +568,10 @@ export function createServer() {
     'List all users in the Notion workspace. Returns IDs, names, emails, types (person/bot), and avatars.',
     {
       page_size: z.number().min(1).max(100).optional().describe('Number of users (default 100)'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_size }) => {
-      const users = await notionClient.getUsers(page_size);
+    async ({ page_size, workspace }) => {
+      const users = await notionClient.getUsers(page_size, { workspace });
       const lines = users.map(u =>
         `${u.name} (${u.type}) — ID: ${u.id}${u.email ? ` — ${u.email}` : ''}`
       );
@@ -565,9 +588,10 @@ export function createServer() {
     'Retrieve details for a specific Notion user by ID. Returns name, type, email, and avatar.',
     {
       user_id: z.string().describe('Notion user ID (UUID)'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ user_id }) => {
-      const user = await notionClient.getUser(user_id);
+    async ({ user_id, workspace }) => {
+      const user = await notionClient.getUser(user_id, { workspace });
       return {
         content: [{
           type: 'text',
@@ -586,12 +610,13 @@ export function createServer() {
     'Fetch multiple Notion pages in one call. Returns each page with title, properties, and full Markdown content. More efficient than calling fetch_page multiple times.',
     {
       page_ids: z.array(z.string()).describe('Array of page IDs (UUIDs or Notion URLs)'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_ids }) => {
+    async ({ page_ids, workspace }) => {
       const results = [];
       for (const pid of page_ids) {
         try {
-          const page = await notionClient.fetchPage(pid);
+          const page = await notionClient.fetchPage(pid, { workspace });
           results.push({ id: page.id, title: page.title, url: page.url, properties: page.properties, content: page.content });
         } catch (e) {
           results.push({ id: pid, error: e.message });
@@ -610,12 +635,13 @@ export function createServer() {
     'Fetch multiple Notion database schemas in one call. Returns each database with title, description, and full schema. More efficient than calling fetch_database multiple times.',
     {
       database_ids: z.array(z.string()).describe('Array of database IDs (UUIDs or Notion URLs)'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ database_ids }) => {
+    async ({ database_ids, workspace }) => {
       const results = [];
       for (const did of database_ids) {
         try {
-          const db = await notionClient.fetchDatabase(did);
+          const db = await notionClient.fetchDatabase(did, { workspace });
           results.push({ id: db.id, title: db.title, url: db.url, schema: db.schema });
         } catch (e) {
           results.push({ id: did, error: e.message });
@@ -636,9 +662,10 @@ export function createServer() {
       page_id: z.string().describe('Page ID to move (UUID)'),
       new_parent_id: z.string().describe('Destination parent ID (page or database UUID)'),
       is_database: z.boolean().optional().describe('True if new parent is a database (default false)'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ page_id, new_parent_id, is_database }) => {
-      const result = await notionClient.movePage(page_id, new_parent_id, is_database);
+    async ({ page_id, new_parent_id, is_database, workspace }) => {
+      const result = await notionClient.movePage(page_id, new_parent_id, is_database, { workspace });
       return {
         content: [{
           type: 'text',
@@ -659,13 +686,37 @@ export function createServer() {
       source_page_id: z.string().describe('Source page ID to duplicate (UUID or Notion URL)'),
       new_parent_id: z.string().optional().describe('Optional new parent ID. If omitted, copy goes under the same parent as the source.'),
       new_title: z.string().optional().describe('Title for the copy. If omitted, uses source title.'),
+      workspace: WORKSPACE_ENUM,
     },
-    async ({ source_page_id, new_parent_id, new_title }) => {
-      const result = await notionClient.duplicatePage(source_page_id, new_parent_id, new_title);
+    async ({ source_page_id, new_parent_id, new_title, workspace }) => {
+      const result = await notionClient.duplicatePage(source_page_id, new_parent_id, new_title, { workspace });
       return {
         content: [{
           type: 'text',
           text: `Page duplicated.\nNew ID: ${result.id}\nTitle: ${result.title}\nURL: ${result.url}`,
+        }],
+      };
+    }
+  );
+
+  // ============================================================
+  // 27. UPDATE BLOCK
+  // ============================================================
+
+  server.tool(
+    'update_block',
+    'Update a specific Notion block. Pass the block type-specific data to modify. Supports changing text content, toggling, and other block-specific properties.',
+    {
+      block_id: z.string().describe('Block ID to update (UUID)'),
+      data: z.record(z.any()).describe('Block update data in Notion API format (block type-specific fields)'),
+      workspace: WORKSPACE_ENUM,
+    },
+    async ({ block_id, data, workspace }) => {
+      const result = await notionClient.updateBlock(block_id, data, { workspace });
+      return {
+        content: [{
+          type: 'text',
+          text: `Block updated.\nID: ${result.id}\nType: ${result.type}`,
         }],
       };
     }
