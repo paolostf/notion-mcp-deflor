@@ -373,11 +373,9 @@ class NotionClient {
 
     for (const update of contentUpdates) {
       if (!update.oldStr) {
-        // Full replacement: delete all blocks, append new content
+        // Full replacement: delete all blocks in parallel batches, append new content
         const existingBlocks = await this._getAllBlocks(id, 0, client);
-        for (const block of existingBlocks) {
-          try { await client.blocks.update({ block_id: block.id, archived: true }); } catch (e) { /* skip undeletable */ }
-        }
+        await this._deleteBlocksBatch(existingBlocks, client);
         if (update.newStr) {
           const newBlocks = markdownToBlocks(update.newStr);
           await this.appendContent(id, newBlocks, { workspace });
@@ -387,23 +385,29 @@ class NotionClient {
         const blocks = await this._getAllBlocks(id, 0, client);
         const fullMarkdown = blocksToMarkdown(blocks);
 
-        if (!fullMarkdown.includes(update.oldStr)) {
-          throw new Error(`Content not found: "${update.oldStr.substring(0, 100)}..."`);
+        // Normalize both strings for matching (handle unicode variants)
+        const normalizedMarkdown = this._normalizeText(fullMarkdown);
+        const normalizedOldStr = this._normalizeText(update.oldStr);
+
+        if (!normalizedMarkdown.includes(normalizedOldStr)) {
+          // Try fuzzy match: collapse whitespace and compare
+          const fuzzyMarkdown = normalizedMarkdown.replace(/\s+/g, ' ');
+          const fuzzyOldStr = normalizedOldStr.replace(/\s+/g, ' ');
+          if (!fuzzyMarkdown.includes(fuzzyOldStr)) {
+            throw new Error(`Content not found: "${update.oldStr.substring(0, 100)}..." — Try using fetch_page first to get the exact text, or use append_content to add to the end instead.`);
+          }
         }
 
-        // Simple approach: replace in markdown, then replace all content
+        // Replace using normalized matching but preserve original content elsewhere
         let newMarkdown;
         if (update.replaceAllMatches) {
-          newMarkdown = fullMarkdown.split(update.oldStr).join(update.newStr);
+          newMarkdown = this._normalizedReplace(fullMarkdown, update.oldStr, update.newStr, true);
         } else {
-          const idx = fullMarkdown.indexOf(update.oldStr);
-          newMarkdown = fullMarkdown.substring(0, idx) + update.newStr + fullMarkdown.substring(idx + update.oldStr.length);
+          newMarkdown = this._normalizedReplace(fullMarkdown, update.oldStr, update.newStr, false);
         }
 
-        // Delete all existing blocks and replace with new content
-        for (const block of blocks) {
-          try { await client.blocks.update({ block_id: block.id, archived: true }); } catch (e) { /* skip */ }
-        }
+        // Delete all existing blocks in parallel batches and replace with new content
+        await this._deleteBlocksBatch(blocks, client);
         const newBlocks = markdownToBlocks(newMarkdown);
         if (newBlocks.length > 0) {
           await this.appendContent(id, newBlocks, { workspace });
@@ -411,7 +415,59 @@ class NotionClient {
       }
     }
 
-    return this.fetchPage(pageId, { workspace });
+    // Return lightweight confirmation instead of full page fetch (which doubles latency)
+    return { id, status: 'updated', updates_applied: contentUpdates.length };
+  }
+
+  /** Delete blocks in parallel batches of 10 for speed */
+  async _deleteBlocksBatch(blocks, client) {
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < blocks.length; i += BATCH_SIZE) {
+      const batch = blocks.slice(i, i + BATCH_SIZE);
+      await Promise.all(batch.map(block =>
+        client.blocks.update({ block_id: block.id, archived: true }).catch(() => {})
+      ));
+    }
+  }
+
+  /** Normalize text for comparison: normalize unicode, standardize dashes/quotes */
+  _normalizeText(text) {
+    return text
+      .normalize('NFC')
+      .replace(/\u2014/g, '—')  // em dash
+      .replace(/\u2013/g, '–')  // en dash
+      .replace(/[\u2018\u2019]/g, "'")  // smart single quotes
+      .replace(/[\u201C\u201D]/g, '"')  // smart double quotes
+      .replace(/\u00A0/g, ' ')  // non-breaking space
+      .replace(/\r\n/g, '\n');  // normalize line endings
+  }
+
+  /** Replace using normalized matching but preserve original content around the match */
+  _normalizedReplace(original, oldStr, newStr, replaceAll) {
+    const normOrig = this._normalizeText(original);
+    const normOld = this._normalizeText(oldStr);
+
+    if (replaceAll) {
+      // Find all match positions in normalized text, replace in original
+      let result = '';
+      let origIdx = 0;
+      let normIdx = 0;
+      while (normIdx < normOrig.length) {
+        const matchPos = normOrig.indexOf(normOld, normIdx);
+        if (matchPos === -1) {
+          result += original.substring(origIdx);
+          break;
+        }
+        result += original.substring(origIdx, matchPos) + newStr;
+        origIdx = matchPos + normOld.length;
+        normIdx = matchPos + normOld.length;
+      }
+      return result || original;
+    } else {
+      const idx = normOrig.indexOf(normOld);
+      if (idx === -1) return original;
+      return original.substring(0, idx) + newStr + original.substring(idx + normOld.length);
+    }
   }
 
   // ============================================================

@@ -10,7 +10,7 @@ app.use(express.json({ limit: '10mb' }));
 const sessions = new Map();
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', server: 'Notion Unlocked', version: '2.4.0', capabilities: ['multi-workspace', 'diff-editing', 'batch-ops', 'block-control'] });
+  res.json({ status: 'ok', server: 'Notion Unlocked', version: '2.5.0', capabilities: ['multi-workspace', 'diff-editing', 'batch-ops', 'block-control', 'parallel-deletes', 'unicode-normalization'] });
 });
 
 app.post('/mcp', async (req, res) => {
@@ -64,5 +64,5 @@ app.delete('/mcp', async (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Notion Unlocked v2.4.0 running on port ${PORT}`);
+  console.log(`Notion Unlocked v2.5.0 running on port ${PORT}`);
 });
