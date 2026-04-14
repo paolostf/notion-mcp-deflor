@@ -452,15 +452,17 @@ class NotionClient {
   }
 
   // ============================================================
-  // UPDATE PAGE CONTENT (surgical diffing — v2.6.0)
+  // UPDATE PAGE CONTENT (v2.6.0 — surgical editing)
   //
-  // Architecture: NEVER delete-all-then-recreate for targeted edits.
-  // For targeted edits (oldStr/newStr):
-  //   1. Find which blocks contain the match
-  //   2. INSERT new blocks at correct position (using 'after' param)
-  //   3. DELETE only the affected blocks
-  //   Safety: insert-before-delete means interruption = duplicates (recoverable),
-  //   never data loss (unrecoverable).
+  // Priority chain for targeted edits (oldStr/newStr):
+  //   1. IN-PLACE: If edit is within ONE block → blocks.update on rich_text.
+  //      No deletion, no creation, no markdown round-trip.
+  //      Preserves: block ID, comments, formatting, children.
+  //   2. BLOCK-LEVEL: If edit spans multiple blocks → insert new blocks
+  //      at correct position (after param), then delete affected blocks.
+  //      Insert-before-delete = interruption produces duplicates, not data loss.
+  //   3. FULL REPLACE: Fallback for edge cases (fuzzy match, block-0 edits).
+  //      Append new content, then delete old blocks.
   //
   // For full replacement (no oldStr):
   //   Uses append-then-delete with page lock + idempotency guard.
@@ -557,12 +559,16 @@ class NotionClient {
 
   /**
    * Surgical single-occurrence replacement.
-   * Finds the exact block range containing the match, inserts new blocks
-   * at the correct position using Notion's 'after' parameter, then deletes
-   * only the affected blocks.
    *
-   * Safety: INSERT first, DELETE second.
-   * Worst case on interruption: duplicated blocks (never data loss).
+   * Strategy (in priority order):
+   * 1. IN-PLACE UPDATE: If the edit falls within a single block, modify
+   *    that block's rich_text directly via blocks.update. No deletion,
+   *    no creation, no markdown round-trip. Preserves block ID, comments,
+   *    and formatting on unaffected segments.
+   * 2. BLOCK-LEVEL REPLACE: If the edit spans multiple blocks, insert new
+   *    blocks at the correct position (using 'after' param), then delete
+   *    only the affected blocks. Insert-before-delete = safe on interruption.
+   * 3. SAFE FULL REPLACE: Fallback for edge cases (fuzzy match, block 0 edits).
    */
   async _surgicalReplace(pageId, update, workspace, client) {
     const blocks = await this._getAllBlocks(pageId, 0, client);
@@ -608,20 +614,14 @@ class NotionClient {
     const matchEnd = matchStart + normOld.length;
 
     // Map character offsets to block indices
-    // We need to find which blocks the match spans
     let startBlockIdx = -1;
     let endBlockIdx = -1;
     for (let i = 0; i < blockMeta.length; i++) {
       const bm = blockMeta[i];
-      // Account for \n separators: the separator between block i-1 and block i
-      // is at offset (bm.start - 1) for i > 0
-      const blockStart = bm.start;
-      const blockEnd = bm.end;
-
-      if (startBlockIdx === -1 && blockEnd > matchStart) {
+      if (startBlockIdx === -1 && bm.end > matchStart) {
         startBlockIdx = i;
       }
-      if (blockStart < matchEnd) {
+      if (bm.start < matchEnd) {
         endBlockIdx = i;
       }
     }
@@ -629,7 +629,24 @@ class NotionClient {
     if (startBlockIdx === -1) startBlockIdx = 0;
     if (endBlockIdx === -1) endBlockIdx = blocks.length - 1;
 
-    // Build replacement markdown for the affected block range
+    // ──────────────────────────────────────────────────────
+    // STRATEGY 1: IN-PLACE UPDATE (single block, no structural change)
+    // ──────────────────────────────────────────────────────
+    if (startBlockIdx === endBlockIdx) {
+      const block = blocks[startBlockIdx];
+      const updated = this._tryInPlaceBlockUpdate(block, update.oldStr, update.newStr);
+      if (updated) {
+        // Apply the in-place update via Notion API — preserves block ID, comments, formatting
+        await client.blocks.update({ block_id: block.id, ...updated });
+        return;
+      }
+      // If in-place update not possible (structural change), fall through to block-level replace
+    }
+
+    // ──────────────────────────────────────────────────────
+    // STRATEGY 2: BLOCK-LEVEL REPLACE (multi-block or structural change)
+    // Insert new blocks at correct position, then delete affected blocks.
+    // ──────────────────────────────────────────────────────
     const affectedMarkdown = blockMeta
       .slice(startBlockIdx, endBlockIdx + 1)
       .map(bm => bm.markdown)
@@ -639,49 +656,146 @@ class NotionClient {
       affectedMarkdown, update.oldStr, update.newStr, false
     );
 
-    // Convert replacement to Notion blocks
     const newBlocks = markdownToBlocks(newAffectedMarkdown);
-
-    // Determine anchor block (block before the affected range)
     const anchorBlockId = startBlockIdx > 0 ? blocks[startBlockIdx - 1].id : null;
-
-    // Affected blocks to delete
-    const affectedBlockIds = blocks
-      .slice(startBlockIdx, endBlockIdx + 1)
-      .map(b => b.id);
 
     // SAFE ORDER: INSERT FIRST, DELETE SECOND
     if (newBlocks.length > 0) {
       if (anchorBlockId) {
-        // Insert new blocks after the anchor block (correct position)
         await this._appendAfter(pageId, newBlocks, anchorBlockId, client);
       } else {
-        // Match starts at the very first block — no anchor to insert after.
-        // Strategy: append new blocks at end, then delete old blocks, then
-        // the remaining blocks (after the deleted range) will follow the new blocks.
-        // But wait — if there are blocks AFTER the affected range, the order would be:
-        //   [remaining blocks after range] ... [new blocks at end]
-        // which is wrong. We need new blocks at the START.
-        //
-        // Better strategy for start-of-page edits:
-        // If there are blocks AFTER the affected range, use their first block as reference:
-        //   1. Insert new blocks at end
-        //   2. Delete affected blocks
-        //   3. The remaining (unaffected) blocks after the range stay in place
-        //   This only works if there are NO unaffected blocks before the range (startBlockIdx === 0).
-        //   Since startBlockIdx IS 0 here, all blocks before the range are affected.
-        //
-        // Actually the simplest correct approach: do a safe full replace for this edge case.
-        // This only triggers when the edit affects the very first block of the page.
+        // Edit affects the first block and in-place update wasn't possible.
+        // Fall back to safe full replace for this edge case.
         const newFullMarkdown = this._normalizedReplace(fullMarkdown, update.oldStr, update.newStr, false);
         await this._safeFullReplace(pageId, newFullMarkdown, workspace, client);
         return;
       }
     }
 
-    // Now delete the old affected blocks
+    // Delete the old affected blocks
     const affectedBlocks = blocks.slice(startBlockIdx, endBlockIdx + 1);
     await this._deleteBlocksBatch(affectedBlocks, client);
+  }
+
+  // ============================================================
+  // IN-PLACE BLOCK UPDATE — modifies rich_text directly, no round-trip
+  // ============================================================
+
+  /**
+   * Try to update a block's text content in-place by modifying its rich_text array.
+   * Returns the Notion API update payload if successful, or null if not possible.
+   *
+   * Works for: paragraph, heading_1/2/3, bulleted_list_item, numbered_list_item,
+   * to_do, toggle, quote, callout, code.
+   *
+   * Preserves: block ID, block type, formatting on unaffected rich_text segments,
+   * comments attached to the block, block color, children.
+   */
+  _tryInPlaceBlockUpdate(block, oldStr, newStr) {
+    const type = block.type;
+    const data = block[type];
+    if (!data || !data.rich_text) return null;
+
+    // Don't attempt in-place if newStr contains newlines (would need new blocks)
+    if (newStr.includes('\n')) return null;
+
+    // Get the full plain text of this block
+    const segments = data.rich_text;
+    const fullText = segments.map(s => s.plain_text || '').join('');
+    const normFullText = this._normalizeText(fullText);
+    const normOld = this._normalizeText(oldStr);
+
+    const normIdx = normFullText.indexOf(normOld);
+    if (normIdx === -1) return null;
+
+    // Map normalized match position back to original text positions
+    const origStart = this._mapNormToOrigIndex(fullText, normIdx);
+    const origEnd = this._mapNormToOrigIndex(fullText, normIdx + normOld.length);
+
+    // Build new rich_text array with the replacement applied
+    const newRichText = this._spliceRichText(segments, origStart, origEnd, newStr);
+    if (!newRichText) return null;
+
+    // Build the update payload — only the block type key with new rich_text
+    const payload = {};
+    payload[type] = { rich_text: newRichText };
+
+    return payload;
+  }
+
+  /**
+   * Splice a replacement string into a rich_text array at character positions
+   * [start, end). Preserves annotations on segments before and after the edit.
+   * Segments that partially overlap the edit range are split.
+   *
+   * Returns new rich_text array, or null if the splice isn't possible.
+   */
+  _spliceRichText(segments, start, end, replacement) {
+    const result = [];
+    let charPos = 0;
+
+    for (const seg of segments) {
+      const text = seg.plain_text || '';
+      const segStart = charPos;
+      const segEnd = charPos + text.length;
+
+      if (segEnd <= start || segStart >= end) {
+        // Segment is entirely outside the edit range — keep as-is
+        result.push(this._cloneRichTextSegment(seg));
+      } else {
+        // Segment overlaps the edit range
+
+        // Part before the edit (if any)
+        if (segStart < start) {
+          const beforeText = text.substring(0, start - segStart);
+          result.push(this._cloneRichTextSegment(seg, beforeText));
+        }
+
+        // Insert the replacement text (only once, at the first overlapping segment)
+        if (segStart <= start) {
+          if (replacement) {
+            // Inherit annotations from the segment where the edit starts
+            result.push(this._cloneRichTextSegment(seg, replacement));
+          }
+        }
+
+        // Part after the edit (if any)
+        if (segEnd > end) {
+          const afterText = text.substring(end - segStart);
+          result.push(this._cloneRichTextSegment(seg, afterText));
+        }
+      }
+
+      charPos = segEnd;
+    }
+
+    // Filter out empty text segments
+    return result.filter(s => s.text?.content);
+  }
+
+  /**
+   * Clone a rich_text segment, optionally replacing its text content.
+   * Preserves: annotations (bold, italic, strikethrough, underline, code, color),
+   * link URL, and type.
+   */
+  _cloneRichTextSegment(seg, newContent) {
+    const clone = {
+      type: 'text',
+      text: {
+        content: newContent !== undefined ? newContent : (seg.plain_text || seg.text?.content || ''),
+      },
+      annotations: seg.annotations ? { ...seg.annotations } : undefined,
+    };
+
+    // Preserve link if present and content is unchanged or explicitly set
+    if (seg.text?.link?.url) {
+      clone.text.link = { url: seg.text.link.url };
+    }
+
+    // Remove undefined annotations key to keep payload clean
+    if (!clone.annotations) delete clone.annotations;
+
+    return clone;
   }
 
   /**
