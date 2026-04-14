@@ -1,5 +1,6 @@
 // notion-client.js — High-level Notion API client
 // Wraps @notionhq/client with methods designed for LLM tool consumption
+// v2.6.0 — Surgical content editing, operation locking, idempotency
 
 import { Client } from '@notionhq/client';
 import { blocksToMarkdown, markdownToBlocks, formatProperties, formatDatabaseSchema } from './blocks.js';
@@ -16,6 +17,65 @@ const DEFAULT_WORKSPACE = 'deflorance';
 class NotionClient {
   constructor() {
     this.clients = {};  // workspace -> Client instance
+    this._pageLocks = new Map();  // pageId -> Promise (mutex per page)
+    this._opCache = new Map();  // opHash -> { result, timestamp }
+    this._OP_CACHE_TTL = 30000;  // 30s idempotency window
+  }
+
+  // ============================================================
+  // PAGE LOCK — prevents concurrent destructive operations on same page
+  // ============================================================
+
+  async _withPageLock(pageId, fn) {
+    // Wait for any existing lock on this page to release
+    while (this._pageLocks.has(pageId)) {
+      await this._pageLocks.get(pageId).catch(() => {});
+    }
+    // Acquire lock
+    let resolve;
+    const lockPromise = new Promise(r => { resolve = r; });
+    this._pageLocks.set(pageId, lockPromise);
+    try {
+      return await fn();
+    } finally {
+      this._pageLocks.delete(pageId);
+      resolve();
+    }
+  }
+
+  // ============================================================
+  // IDEMPOTENCY — prevents retry re-execution of destructive ops
+  // ============================================================
+
+  _opHash(pageId, updates) {
+    // Deterministic hash of the operation params
+    const key = JSON.stringify({ pageId, updates });
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+      hash = ((hash << 5) - hash + key.charCodeAt(i)) | 0;
+    }
+    return `op_${pageId}_${hash}`;
+  }
+
+  _getCachedOp(hash) {
+    const entry = this._opCache.get(hash);
+    if (!entry) return null;
+    if (Date.now() - entry.timestamp > this._OP_CACHE_TTL) {
+      this._opCache.delete(hash);
+      return null;
+    }
+    return entry.result;
+  }
+
+  _cacheOp(hash, result) {
+    this._opCache.set(hash, { result, timestamp: Date.now() });
+    // Prune old entries every 50 operations
+    if (this._opCache.size > 50) {
+      const now = Date.now();
+      for (const [k, v] of this._opCache) {
+        if (now - v.timestamp > this._OP_CACHE_TTL) this._opCache.delete(k);
+      }
+    }
   }
 
   /** Get or create a Notion Client for the given workspace */
@@ -86,16 +146,22 @@ class NotionClient {
   // FETCH PAGE (metadata + full content as Markdown)
   // ============================================================
 
-  async fetchPage(pageId, { workspace } = {}) {
+  async fetchPage(pageId, { workspace, max_content_length } = {}) {
     const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
     const page = await client.pages.retrieve({ page_id: id });
     const title = this._extractTitle(page);
     const properties = formatProperties(page.properties);
     const blocks = await this._getAllBlocks(id, 0, client);
-    const content = blocksToMarkdown(blocks);
+    let content = blocksToMarkdown(blocks);
 
-    return {
+    let truncated = false;
+    if (max_content_length && content.length > max_content_length) {
+      content = content.substring(0, max_content_length);
+      truncated = true;
+    }
+
+    const result = {
       id: page.id,
       title,
       url: page.url,
@@ -107,6 +173,14 @@ class NotionClient {
       properties,
       content,
     };
+
+    if (truncated) {
+      result.truncated = true;
+      result.full_content_length = blocks.length;
+      result.note = `Content truncated at ${max_content_length} chars. Use fetch_block_children with pagination for full content.`;
+    }
+
+    return result;
   }
 
   // ============================================================
@@ -209,16 +283,30 @@ class NotionClient {
   // APPEND CONTENT (blocks) TO PAGE
   // ============================================================
 
-  async appendContent(pageId, blocks, { workspace } = {}) {
+  async appendContent(pageId, blocks, { workspace, after } = {}) {
     const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
     const results = [];
+
     for (let i = 0; i < blocks.length; i += 100) {
-      const response = await client.blocks.children.append({
+      const params = {
         block_id: id,
         children: blocks.slice(i, i + 100),
-      });
+      };
+      // Use 'after' param for first batch only; subsequent batches follow naturally
+      if (i === 0 && after) {
+        params.after = after;
+      }
+      const response = await client.blocks.children.append(params);
       results.push(...response.results);
+      // For subsequent batches, insert after the last block of previous batch
+      if (results.length > 0 && i + 100 < blocks.length) {
+        // Next batch inserts after the last block we just created
+        // But we need to NOT pass 'after' for subsequent batches since
+        // Notion appends at the end by default (after our just-created blocks)
+        // Actually, without 'after', it appends at the very end of the page,
+        // which is correct since we're building sequentially
+      }
     }
     return { appended: results.length, block_ids: results.map(b => b.id) };
   }
@@ -364,110 +452,381 @@ class NotionClient {
   }
 
   // ============================================================
-  // UPDATE PAGE CONTENT (oldStr/newStr diffing)
+  // UPDATE PAGE CONTENT (surgical diffing — v2.6.0)
+  //
+  // Architecture: NEVER delete-all-then-recreate for targeted edits.
+  // For targeted edits (oldStr/newStr):
+  //   1. Find which blocks contain the match
+  //   2. INSERT new blocks at correct position (using 'after' param)
+  //   3. DELETE only the affected blocks
+  //   Safety: insert-before-delete means interruption = duplicates (recoverable),
+  //   never data loss (unrecoverable).
+  //
+  // For full replacement (no oldStr):
+  //   Uses append-then-delete with page lock + idempotency guard.
+  //
+  // Per-page mutex lock prevents concurrent destructive operations.
+  // Idempotency cache prevents MCP transport retries from re-executing.
   // ============================================================
 
   async updatePageContent(pageId, contentUpdates, { workspace } = {}) {
     const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
 
-    for (const update of contentUpdates) {
-      if (!update.oldStr) {
-        // Full replacement: delete all blocks in parallel batches, append new content
-        const existingBlocks = await this._getAllBlocks(id, 0, client);
-        await this._deleteBlocksBatch(existingBlocks, client);
-        if (update.newStr) {
-          const newBlocks = markdownToBlocks(update.newStr);
-          await this.appendContent(id, newBlocks, { workspace });
-        }
-      } else {
-        // Targeted replacement: find matching blocks, replace
-        const blocks = await this._getAllBlocks(id, 0, client);
-        const fullMarkdown = blocksToMarkdown(blocks);
+    // Idempotency check: if this exact operation was already completed recently, return cached result
+    const opHash = this._opHash(id, contentUpdates);
+    const cached = this._getCachedOp(opHash);
+    if (cached) {
+      return { ...cached, idempotent_replay: true };
+    }
 
-        // Normalize both strings for matching (handle unicode variants)
-        const normalizedMarkdown = this._normalizeText(fullMarkdown);
-        const normalizedOldStr = this._normalizeText(update.oldStr);
+    // Acquire page-level lock (prevents concurrent modifications)
+    const result = await this._withPageLock(id, async () => {
+      // Double-check idempotency inside lock (another request may have completed while we waited)
+      const cached2 = this._getCachedOp(opHash);
+      if (cached2) return { ...cached2, idempotent_replay: true };
 
-        if (!normalizedMarkdown.includes(normalizedOldStr)) {
-          // Try fuzzy match: collapse whitespace and compare
-          const fuzzyMarkdown = normalizedMarkdown.replace(/\s+/g, ' ');
-          const fuzzyOldStr = normalizedOldStr.replace(/\s+/g, ' ');
-          if (!fuzzyMarkdown.includes(fuzzyOldStr)) {
-            throw new Error(`Content not found: "${update.oldStr.substring(0, 100)}..." — Try using fetch_page first to get the exact text, or use append_content to add to the end instead.`);
-          }
-        }
-
-        // Replace using normalized matching but preserve original content elsewhere
-        let newMarkdown;
-        if (update.replaceAllMatches) {
-          newMarkdown = this._normalizedReplace(fullMarkdown, update.oldStr, update.newStr, true);
+      for (const update of contentUpdates) {
+        if (!update.oldStr) {
+          // Full replacement: delete all blocks, append new content
+          await this._safeFullReplace(id, update.newStr, workspace, client);
+        } else if (update.replaceAllMatches) {
+          // Replace all occurrences: must rebuild entire page content
+          await this._replaceAllInPage(id, update, workspace, client);
         } else {
-          newMarkdown = this._normalizedReplace(fullMarkdown, update.oldStr, update.newStr, false);
+          // Targeted single replacement: surgical block-level edit
+          await this._surgicalReplace(id, update, workspace, client);
         }
+      }
 
-        // Delete all existing blocks in parallel batches and replace with new content
-        await this._deleteBlocksBatch(blocks, client);
-        const newBlocks = markdownToBlocks(newMarkdown);
-        if (newBlocks.length > 0) {
-          await this.appendContent(id, newBlocks, { workspace });
-        }
+      return { id, status: 'updated', updates_applied: contentUpdates.length };
+    });
+
+    // Cache the result for idempotency
+    this._cacheOp(opHash, result);
+    return result;
+  }
+
+  /**
+   * Full page content replacement.
+   * Order: append new content at end → delete old blocks.
+   * If interrupted after append but before delete: duplicated content (recoverable).
+   * If interrupted during delete: partial old content remains (recoverable).
+   * Page lock prevents retries from causing infinite loops.
+   */
+  async _safeFullReplace(pageId, newContent, workspace, client) {
+    const existingBlocks = await this._getAllBlocks(pageId, 0, client);
+
+    if (newContent) {
+      const newBlocks = markdownToBlocks(newContent);
+      if (newBlocks.length > 0) {
+        await this.appendContent(pageId, newBlocks, { workspace });
       }
     }
 
-    // Return lightweight confirmation instead of full page fetch (which doubles latency)
-    return { id, status: 'updated', updates_applied: contentUpdates.length };
+    // Delete old blocks (new content is already appended at the end)
+    if (existingBlocks.length > 0) {
+      await this._deleteBlocksBatch(existingBlocks, client);
+    }
   }
 
-  /** Delete blocks in parallel batches of 10 for speed */
+  /**
+   * Replace all occurrences of oldStr with newStr across entire page.
+   * Must rebuild full page since matches may span block boundaries.
+   * Uses safe full replace (append-then-delete).
+   */
+  async _replaceAllInPage(pageId, update, workspace, client) {
+    const blocks = await this._getAllBlocks(pageId, 0, client);
+    const fullMarkdown = blocksToMarkdown(blocks);
+
+    const newMarkdown = this._normalizedReplace(fullMarkdown, update.oldStr, update.newStr, true);
+
+    if (newMarkdown === fullMarkdown) {
+      throw new Error(`Content not found: "${update.oldStr.substring(0, 100)}..." — Try using fetch_page first to get the exact text.`);
+    }
+
+    // Use safe full replace: append new, delete old
+    const newBlocks = markdownToBlocks(newMarkdown);
+    if (newBlocks.length > 0) {
+      await this.appendContent(pageId, newBlocks, { workspace });
+    }
+    if (blocks.length > 0) {
+      await this._deleteBlocksBatch(blocks, client);
+    }
+  }
+
+  /**
+   * Surgical single-occurrence replacement.
+   * Finds the exact block range containing the match, inserts new blocks
+   * at the correct position using Notion's 'after' parameter, then deletes
+   * only the affected blocks.
+   *
+   * Safety: INSERT first, DELETE second.
+   * Worst case on interruption: duplicated blocks (never data loss).
+   */
+  async _surgicalReplace(pageId, update, workspace, client) {
+    const blocks = await this._getAllBlocks(pageId, 0, client);
+
+    // Build per-block markdown with character offset mapping
+    const blockMeta = [];
+    let offset = 0;
+    for (let i = 0; i < blocks.length; i++) {
+      const md = blocksToMarkdown([blocks[i]]);
+      blockMeta.push({
+        block: blocks[i],
+        markdown: md,
+        start: offset,
+        end: offset + md.length,
+      });
+      offset += md.length;
+      if (i < blocks.length - 1) offset += 1; // \n separator
+    }
+
+    const fullMarkdown = blockMeta.map(bm => bm.markdown).join('\n');
+    const normFull = this._normalizeText(fullMarkdown);
+    const normOld = this._normalizeText(update.oldStr);
+
+    // Find match position in normalized text
+    let matchStart = normFull.indexOf(normOld);
+
+    if (matchStart === -1) {
+      // Try fuzzy match (collapse whitespace)
+      const fuzzyFull = normFull.replace(/\s+/g, ' ');
+      const fuzzyOld = normOld.replace(/\s+/g, ' ');
+      if (!fuzzyFull.includes(fuzzyOld)) {
+        throw new Error(
+          `Content not found: "${update.oldStr.substring(0, 100)}..." — ` +
+          `Try using fetch_page first to get the exact text, or use append_content to add to the end instead.`
+        );
+      }
+      // Fuzzy match found but can't map to exact block positions — fall back to full replace
+      const newMarkdown = this._normalizedReplace(fullMarkdown, update.oldStr, update.newStr, false);
+      await this._safeFullReplace(pageId, newMarkdown, workspace, client);
+      return;
+    }
+
+    const matchEnd = matchStart + normOld.length;
+
+    // Map character offsets to block indices
+    // We need to find which blocks the match spans
+    let startBlockIdx = -1;
+    let endBlockIdx = -1;
+    for (let i = 0; i < blockMeta.length; i++) {
+      const bm = blockMeta[i];
+      // Account for \n separators: the separator between block i-1 and block i
+      // is at offset (bm.start - 1) for i > 0
+      const blockStart = bm.start;
+      const blockEnd = bm.end;
+
+      if (startBlockIdx === -1 && blockEnd > matchStart) {
+        startBlockIdx = i;
+      }
+      if (blockStart < matchEnd) {
+        endBlockIdx = i;
+      }
+    }
+
+    if (startBlockIdx === -1) startBlockIdx = 0;
+    if (endBlockIdx === -1) endBlockIdx = blocks.length - 1;
+
+    // Build replacement markdown for the affected block range
+    const affectedMarkdown = blockMeta
+      .slice(startBlockIdx, endBlockIdx + 1)
+      .map(bm => bm.markdown)
+      .join('\n');
+
+    const newAffectedMarkdown = this._normalizedReplace(
+      affectedMarkdown, update.oldStr, update.newStr, false
+    );
+
+    // Convert replacement to Notion blocks
+    const newBlocks = markdownToBlocks(newAffectedMarkdown);
+
+    // Determine anchor block (block before the affected range)
+    const anchorBlockId = startBlockIdx > 0 ? blocks[startBlockIdx - 1].id : null;
+
+    // Affected blocks to delete
+    const affectedBlockIds = blocks
+      .slice(startBlockIdx, endBlockIdx + 1)
+      .map(b => b.id);
+
+    // SAFE ORDER: INSERT FIRST, DELETE SECOND
+    if (newBlocks.length > 0) {
+      if (anchorBlockId) {
+        // Insert new blocks after the anchor block (correct position)
+        await this._appendAfter(pageId, newBlocks, anchorBlockId, client);
+      } else {
+        // Match starts at the very first block — no anchor to insert after.
+        // Strategy: append new blocks at end, then delete old blocks, then
+        // the remaining blocks (after the deleted range) will follow the new blocks.
+        // But wait — if there are blocks AFTER the affected range, the order would be:
+        //   [remaining blocks after range] ... [new blocks at end]
+        // which is wrong. We need new blocks at the START.
+        //
+        // Better strategy for start-of-page edits:
+        // If there are blocks AFTER the affected range, use their first block as reference:
+        //   1. Insert new blocks at end
+        //   2. Delete affected blocks
+        //   3. The remaining (unaffected) blocks after the range stay in place
+        //   This only works if there are NO unaffected blocks before the range (startBlockIdx === 0).
+        //   Since startBlockIdx IS 0 here, all blocks before the range are affected.
+        //
+        // Actually the simplest correct approach: do a safe full replace for this edge case.
+        // This only triggers when the edit affects the very first block of the page.
+        const newFullMarkdown = this._normalizedReplace(fullMarkdown, update.oldStr, update.newStr, false);
+        await this._safeFullReplace(pageId, newFullMarkdown, workspace, client);
+        return;
+      }
+    }
+
+    // Now delete the old affected blocks
+    const affectedBlocks = blocks.slice(startBlockIdx, endBlockIdx + 1);
+    await this._deleteBlocksBatch(affectedBlocks, client);
+  }
+
+  /**
+   * Append blocks after a specific block using Notion's 'after' parameter.
+   * Handles chunking for >100 blocks.
+   */
+  async _appendAfter(pageId, blocks, afterBlockId, client) {
+    let currentAfter = afterBlockId;
+    for (let i = 0; i < blocks.length; i += 100) {
+      const chunk = blocks.slice(i, i + 100);
+      const response = await client.blocks.children.append({
+        block_id: pageId,
+        children: chunk,
+        after: currentAfter,
+      });
+      // For subsequent chunks, insert after the last block of this chunk
+      if (response.results.length > 0) {
+        currentAfter = response.results[response.results.length - 1].id;
+      }
+    }
+  }
+
+  /** Delete blocks in parallel batches of 10 for speed. Silently ignores already-deleted blocks. */
   async _deleteBlocksBatch(blocks, client) {
     const BATCH_SIZE = 10;
     for (let i = 0; i < blocks.length; i += BATCH_SIZE) {
       const batch = blocks.slice(i, i + BATCH_SIZE);
       await Promise.all(batch.map(block =>
-        client.blocks.update({ block_id: block.id, archived: true }).catch(() => {})
+        client.blocks.update({ block_id: block.id, archived: true }).catch((err) => {
+          // Ignore 404 (already deleted) and 409 (conflict) — safe for retries
+          if (err?.status === 404 || err?.status === 409) return;
+          // Log but don't throw for other errors during batch delete
+          console.warn(`Block delete warning (${block.id}): ${err?.message || err}`);
+        })
       ));
     }
   }
 
-  /** Normalize text for comparison: normalize unicode, standardize dashes/quotes */
+  /**
+   * Normalize text for comparison.
+   * Handles all unicode variants commonly produced by Notion's renderer:
+   * em dash, en dash, minus sign, horizontal bar, smart quotes,
+   * non-breaking space, multiplication sign, line endings.
+   */
   _normalizeText(text) {
     return text
       .normalize('NFC')
-      .replace(/\u2014/g, '—')  // em dash
-      .replace(/\u2013/g, '–')  // en dash
-      .replace(/[\u2018\u2019]/g, "'")  // smart single quotes
-      .replace(/[\u201C\u201D]/g, '"')  // smart double quotes
-      .replace(/\u00A0/g, ' ')  // non-breaking space
-      .replace(/\r\n/g, '\n');  // normalize line endings
+      // Dashes
+      .replace(/\u2014/g, '\u2014')  // em dash — keep canonical
+      .replace(/\u2013/g, '\u2013')  // en dash – keep canonical
+      .replace(/\u2212/g, '-')       // minus sign → hyphen
+      .replace(/\u2015/g, '\u2014')  // horizontal bar → em dash
+      .replace(/\uFE58/g, '\u2014')  // small em dash → em dash
+      // Quotes
+      .replace(/[\u2018\u2019\u201A\u201B]/g, "'")  // smart single quotes + variants
+      .replace(/[\u201C\u201D\u201E\u201F]/g, '"')  // smart double quotes + variants
+      // Spaces
+      .replace(/\u00A0/g, ' ')       // non-breaking space
+      .replace(/\u2007/g, ' ')       // figure space
+      .replace(/\u202F/g, ' ')       // narrow non-breaking space
+      .replace(/\u200B/g, '')        // zero-width space (remove)
+      .replace(/\uFEFF/g, '')        // BOM / zero-width no-break space (remove)
+      // Math/symbols
+      .replace(/\u00D7/g, 'x')      // multiplication sign × → x
+      .replace(/\u2026/g, '...')     // ellipsis → three dots
+      // Line endings
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n');
   }
 
-  /** Replace using normalized matching but preserve original content around the match */
+  /**
+   * Replace using normalized matching but preserve original content around the match.
+   * Fixed: uses character-by-character mapping between original and normalized text
+   * to correctly handle cases where normalization changes string length.
+   */
   _normalizedReplace(original, oldStr, newStr, replaceAll) {
     const normOrig = this._normalizeText(original);
     const normOld = this._normalizeText(oldStr);
 
-    if (replaceAll) {
-      // Find all match positions in normalized text, replace in original
-      let result = '';
-      let origIdx = 0;
-      let normIdx = 0;
-      while (normIdx < normOrig.length) {
-        const matchPos = normOrig.indexOf(normOld, normIdx);
-        if (matchPos === -1) {
-          result += original.substring(origIdx);
-          break;
-        }
-        result += original.substring(origIdx, matchPos) + newStr;
-        origIdx = matchPos + normOld.length;
-        normIdx = matchPos + normOld.length;
-      }
-      return result || original;
-    } else {
-      const idx = normOrig.indexOf(normOld);
-      if (idx === -1) return original;
-      return original.substring(0, idx) + newStr + original.substring(idx + normOld.length);
+    if (!replaceAll) {
+      // Single replacement
+      const normIdx = normOrig.indexOf(normOld);
+      if (normIdx === -1) return original;
+
+      // Map normalized index back to original index
+      const origStart = this._mapNormToOrigIndex(original, normIdx);
+      const origEnd = this._mapNormToOrigIndex(original, normIdx + normOld.length);
+
+      return original.substring(0, origStart) + newStr + original.substring(origEnd);
     }
+
+    // Replace all: find all occurrences and replace from end to start
+    // (reverse order prevents index shifting)
+    const matches = [];
+    let searchFrom = 0;
+    while (searchFrom < normOrig.length) {
+      const idx = normOrig.indexOf(normOld, searchFrom);
+      if (idx === -1) break;
+      matches.push(idx);
+      searchFrom = idx + normOld.length;
+    }
+
+    if (matches.length === 0) return original;
+
+    // Apply replacements from end to start
+    let result = original;
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const normIdx = matches[i];
+      const origStart = this._mapNormToOrigIndex(original, normIdx);
+      const origEnd = this._mapNormToOrigIndex(original, normIdx + normOld.length);
+      result = result.substring(0, origStart) + newStr + result.substring(origEnd);
+    }
+    return result;
+  }
+
+  /**
+   * Map a character index in normalized text back to the corresponding index
+   * in the original text. Handles length changes from normalization (e.g.,
+   * \u2026 "…" (1 char) → "..." (3 chars) in normalized, or \u200B removed).
+   */
+  _mapNormToOrigIndex(original, normTargetIdx) {
+    // Walk both strings simultaneously
+    let origIdx = 0;
+    let normIdx = 0;
+    const normOrig = this._normalizeText(original);
+
+    while (normIdx < normTargetIdx && origIdx < original.length) {
+      // How many normalized chars does the current original char produce?
+      const origChar = original[origIdx];
+      const normChar = this._normalizeText(origChar);
+      const normCharLen = normChar.length;
+
+      if (normCharLen === 0) {
+        // Original char was removed by normalization (e.g., zero-width space)
+        origIdx++;
+        continue;
+      }
+
+      origIdx++;
+      normIdx += normCharLen;
+    }
+
+    // If normalization expanded chars (like … → ...), we may overshoot
+    // Clamp to original length
+    return Math.min(origIdx, original.length);
   }
 
   // ============================================================

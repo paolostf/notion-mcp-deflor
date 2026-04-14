@@ -1,5 +1,5 @@
 // server.js — Notion Unlocked: MCP server that breaks through Notion's standard API ceiling
-// v2.5.0 — 27 tools, parallel deletes, unicode-normalized diffing, fast updates
+// v2.6.0 — Surgical content editing, operation locking, idempotency, expanded unicode
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -79,7 +79,7 @@ function safeHandler(fn) {
 export function createServer() {
   const server = new McpServer({
     name: 'notion-unlocked',
-    version: '2.5.0',
+    version: '2.6.0',
   });
 
   // ============================================================
