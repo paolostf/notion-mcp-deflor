@@ -79,7 +79,7 @@ function safeHandler(fn) {
 export function createServer() {
   const server = new McpServer({
     name: 'notion-unlocked',
-    version: '2.6.0',
+    version: '3.0.0',
   });
 
   // ============================================================
@@ -1015,15 +1015,16 @@ Individual page errors are caught and returned inline (the batch continues even 
       workspace: WORKSPACE_ENUM,
     },
     safeHandler(async ({ page_ids, workspace }) => {
-      const results = [];
-      for (const pid of page_ids) {
+      // Parallel fetch — per-item errors captured inline so one failure
+      // never aborts the batch. (SDK v5 auto-retries 429 rate limits.)
+      const results = await Promise.all(page_ids.map(async (pid) => {
         try {
           const page = await notionClient.fetchPage(pid, { workspace });
-          results.push({ id: page.id, title: page.title, url: page.url, properties: page.properties, content: page.content });
+          return { id: page.id, title: page.title, url: page.url, properties: page.properties, content: page.content };
         } catch (e) {
-          results.push({ id: pid, error: e.message });
+          return { id: pid, error: e.message };
         }
-      }
+      }));
       return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
     })
   );
@@ -1044,15 +1045,14 @@ Individual database errors are caught and returned inline.
       workspace: WORKSPACE_ENUM,
     },
     safeHandler(async ({ database_ids, workspace }) => {
-      const results = [];
-      for (const did of database_ids) {
+      const results = await Promise.all(database_ids.map(async (did) => {
         try {
           const db = await notionClient.fetchDatabase(did, { workspace });
-          results.push({ id: db.id, title: db.title, url: db.url, schema: db.schema });
+          return { id: db.id, title: db.title, url: db.url, schema: db.schema };
         } catch (e) {
-          results.push({ id: did, error: e.message });
+          return { id: did, error: e.message };
         }
-      }
+      }));
       return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
     })
   );

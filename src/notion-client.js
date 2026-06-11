@@ -14,12 +14,19 @@ const WORKSPACE_REGISTRY = {
 
 const DEFAULT_WORKSPACE = 'deflorance';
 
+// Notion API version. 2026-03-11 is the current breaking version:
+//   • databases are split into databases + data sources (since 2025-09-03)
+//   • the `archived` write field is replaced by `in_trash`
+//   • requires @notionhq/client v5.12+ (we run v5.22)
+const NOTION_VERSION = '2026-03-11';
+
 class NotionClient {
   constructor() {
     this.clients = {};  // workspace -> Client instance
     this._pageLocks = new Map();  // pageId -> Promise (mutex per page)
     this._opCache = new Map();  // opHash -> { result, timestamp }
     this._OP_CACHE_TTL = 30000;  // 30s idempotency window
+    this._dsCache = new Map();  // cleanDatabaseId -> data_source_id (first source)
   }
 
   // ============================================================
@@ -91,8 +98,30 @@ class NotionClient {
     const token = process.env[envVar];
     if (!token) throw new Error(`${envVar} env var required for workspace "${ws}"`);
 
-    this.clients[ws] = new Client({ auth: token });
+    this.clients[ws] = new Client({ auth: token, notionVersion: NOTION_VERSION });
     return this.clients[ws];
+  }
+
+  // ============================================================
+  // DATA SOURCE RESOLUTION (2025-09-03 databases→data-sources split)
+  //
+  // A database now contains one or more data sources. Queries, row
+  // creation, and schema updates target a data_source_id, not the
+  // database_id. We resolve the FIRST data source of a database and
+  // cache it (database_id → data_source_id) for the process lifetime.
+  // ============================================================
+
+  async _resolveDataSourceId(databaseId, client) {
+    const id = this._cleanId(databaseId);
+    if (this._dsCache.has(id)) return this._dsCache.get(id);
+    const db = await client.databases.retrieve({ database_id: id });
+    const sources = db.data_sources || [];
+    if (sources.length === 0) {
+      throw new Error(`Database ${id} has no data sources — cannot query/create. (Notion 2025-09-03 model)`);
+    }
+    const dsId = sources[0].id;
+    this._dsCache.set(id, dsId);
+    return dsId;
   }
 
   /** @deprecated — backward compat, routes to default workspace */
@@ -124,7 +153,9 @@ class NotionClient {
           title,
           url: r.url,
           last_edited: r.last_edited_time,
-          parent: r.parent?.type === 'database_id' ? `database:${r.parent.database_id}` : r.parent?.type,
+          parent: r.parent?.type === 'database_id' ? `database:${r.parent.database_id}`
+                : r.parent?.type === 'data_source_id' ? `data_source:${r.parent.data_source_id}`
+                : r.parent?.type,
         };
       } else if (r.object === 'database') {
         const title = r.title?.map(t => t.plain_text).join('') || 'Untitled';
@@ -192,7 +223,17 @@ class NotionClient {
     const id = this._cleanId(databaseId);
     const db = await client.databases.retrieve({ database_id: id });
     const title = db.title?.map(t => t.plain_text).join('') || 'Untitled';
-    const schema = formatDatabaseSchema(db.properties);
+
+    // Schema lives on the data source now (2025-09-03 split), not the database.
+    const sources = db.data_sources || [];
+    let schema = {};
+    let dataSourceId = null;
+    if (sources.length > 0) {
+      dataSourceId = sources[0].id;
+      this._dsCache.set(id, dataSourceId);
+      const ds = await client.dataSources.retrieve({ data_source_id: dataSourceId });
+      schema = formatDatabaseSchema(ds.properties || {});
+    }
 
     return {
       id: db.id,
@@ -203,6 +244,8 @@ class NotionClient {
       is_inline: db.is_inline,
       created_time: db.created_time,
       last_edited_time: db.last_edited_time,
+      data_source_id: dataSourceId,
+      data_sources: sources.map(s => ({ id: s.id, name: s.name })),
       schema,
     };
   }
@@ -214,12 +257,13 @@ class NotionClient {
   async queryDatabase(databaseId, { filter, sorts, page_size, start_cursor, workspace } = {}) {
     const client = this._getClient(workspace);
     const id = this._cleanId(databaseId);
-    const params = { database_id: id, page_size: page_size || 20 };
+    const dataSourceId = await this._resolveDataSourceId(id, client);
+    const params = { data_source_id: dataSourceId, page_size: page_size || 20 };
     if (filter) params.filter = typeof filter === 'string' ? JSON.parse(filter) : filter;
     if (sorts) params.sorts = typeof sorts === 'string' ? JSON.parse(sorts) : sorts;
     if (start_cursor) params.start_cursor = start_cursor;
 
-    const response = await client.databases.query(params);
+    const response = await client.dataSources.query(params);
     const results = response.results.map(page => ({
       id: page.id,
       url: page.url,
@@ -236,7 +280,14 @@ class NotionClient {
   async createPage(parentId, { properties, content, icon, cover, is_database, workspace } = {}) {
     const client = this._getClient(workspace);
     const id = this._cleanId(parentId);
-    const parent = is_database ? { database_id: id } : { page_id: id };
+    // Database rows are now parented to a data_source_id, not a database_id.
+    let parent;
+    if (is_database) {
+      const dataSourceId = await this._resolveDataSourceId(id, client);
+      parent = { type: 'data_source_id', data_source_id: dataSourceId };
+    } else {
+      parent = { type: 'page_id', page_id: id };
+    }
     const params = { parent };
 
     if (properties) {
@@ -318,7 +369,7 @@ class NotionClient {
   async deleteBlock(blockId, { workspace } = {}) {
     const client = this._getClient(workspace);
     const id = this._cleanId(blockId);
-    await client.blocks.update({ block_id: id, archived: true });
+    await client.blocks.delete({ block_id: id });
     return { deleted: id };
   }
 
@@ -329,15 +380,19 @@ class NotionClient {
   async createDatabase(parentPageId, { title, properties, icon, description, workspace }) {
     const client = this._getClient(workspace);
     const id = this._cleanId(parentPageId);
+    // v5: schema goes under initial_data_source, not top-level properties.
     const params = {
-      parent: { page_id: id },
+      parent: { type: 'page_id', page_id: id },
       title: [{ type: 'text', text: { content: title || 'Untitled Database' } }],
-      properties: properties || { Name: { title: {} } },
+      initial_data_source: {
+        properties: properties || { Name: { title: {} } },
+      },
     };
     if (icon) params.icon = icon.startsWith('http') ? { type: 'external', external: { url: icon } } : { type: 'emoji', emoji: icon };
     if (description) params.description = [{ type: 'text', text: { content: description } }];
 
     const db = await client.databases.create(params);
+    if (db.data_sources?.[0]?.id) this._dsCache.set(this._cleanId(db.id), db.data_sources[0].id);
     return { id: db.id, url: db.url, title: db.title?.map(t => t.plain_text).join('') };
   }
 
@@ -348,13 +403,24 @@ class NotionClient {
   async updateDatabase(databaseId, { title, properties, description, workspace }) {
     const client = this._getClient(workspace);
     const id = this._cleanId(databaseId);
-    const params = { database_id: id };
-    if (title) params.title = [{ type: 'text', text: { content: title } }];
-    if (properties) params.properties = properties;
-    if (description) params.description = [{ type: 'text', text: { content: description } }];
 
-    const db = await client.databases.update(params);
-    return { id: db.id, url: db.url, title: db.title?.map(t => t.plain_text).join('') };
+    // Database-level fields (title, description) stay on databases.update.
+    let dbResult = null;
+    if (title || description) {
+      const params = { database_id: id };
+      if (title) params.title = [{ type: 'text', text: { content: title } }];
+      if (description) params.description = [{ type: 'text', text: { content: description } }];
+      dbResult = await client.databases.update(params);
+    }
+
+    // Schema (column definitions) now lives on the data source.
+    if (properties) {
+      const dataSourceId = await this._resolveDataSourceId(id, client);
+      await client.dataSources.update({ data_source_id: dataSourceId, properties });
+    }
+
+    if (!dbResult) dbResult = await client.databases.retrieve({ database_id: id });
+    return { id: dbResult.id, url: dbResult.url, title: dbResult.title?.map(t => t.plain_text).join('') };
   }
 
   // ============================================================
@@ -423,24 +489,17 @@ class NotionClient {
 
   async archivePages(pageIds, { workspace } = {}) {
     const client = this._getClient(workspace);
-    const results = [];
-    for (const pid of pageIds) {
-      const id = this._cleanId(pid);
-      await client.pages.update({ page_id: id, archived: true });
-      results.push(id);
-    }
-    return { archived: results };
+    const ids = pageIds.map(p => this._cleanId(p));
+    // in_trash replaces archived in 2026-03-11. Parallel for speed.
+    await Promise.all(ids.map(id => client.pages.update({ page_id: id, in_trash: true })));
+    return { archived: ids };
   }
 
   async unarchivePages(pageIds, { workspace } = {}) {
     const client = this._getClient(workspace);
-    const results = [];
-    for (const pid of pageIds) {
-      const id = this._cleanId(pid);
-      await client.pages.update({ page_id: id, archived: false });
-      results.push(id);
-    }
-    return { unarchived: results };
+    const ids = pageIds.map(p => this._cleanId(p));
+    await Promise.all(ids.map(id => client.pages.update({ page_id: id, in_trash: false })));
+    return { unarchived: ids };
   }
 
   async deletePages(pageIds, opts = {}) {
@@ -824,7 +883,7 @@ class NotionClient {
     for (let i = 0; i < blocks.length; i += BATCH_SIZE) {
       const batch = blocks.slice(i, i + BATCH_SIZE);
       await Promise.all(batch.map(block =>
-        client.blocks.update({ block_id: block.id, archived: true }).catch((err) => {
+        client.blocks.delete({ block_id: block.id }).catch((err) => {
           // Ignore 404 (already deleted) and 409 (conflict) — safe for retries
           if (err?.status === 404 || err?.status === 409) return;
           // Log but don't throw for other errors during batch delete
@@ -975,16 +1034,19 @@ class NotionClient {
     const client = this._getClient(workspace);
     const srcId = this._cleanId(sourceDbId);
     const tgtId = this._cleanId(targetDbId);
+    // Relation writes must target a data_source_id (2025-09-03 model).
+    const srcDsId = await this._resolveDataSourceId(srcId, client);
+    const tgtDsId = await this._resolveDataSourceId(tgtId, client);
     const properties = {};
     properties[sourcePropName] = {
       type: 'relation',
       relation: {
-        database_id: tgtId,
+        data_source_id: tgtDsId,
         type: 'dual_property',
         dual_property: { synced_property_name: targetPropName },
       },
     };
-    const db = await client.databases.update({ database_id: srcId, properties });
+    await client.dataSources.update({ data_source_id: srcDsId, properties });
     return {
       source_database_id: srcId,
       target_database_id: tgtId,
@@ -1015,8 +1077,14 @@ class NotionClient {
     const client = this._getClient(workspace);
     const id = this._cleanId(pageId);
     const parentId = this._cleanId(newParentId);
-    const parent = isDatabase ? { database_id: parentId } : { page_id: parentId };
-    const page = await client.pages.update({ page_id: id, ...{ parent } });
+    let parent;
+    if (isDatabase) {
+      const dataSourceId = await this._resolveDataSourceId(parentId, client);
+      parent = { type: 'data_source_id', data_source_id: dataSourceId };
+    } else {
+      parent = { type: 'page_id', page_id: parentId };
+    }
+    const page = await client.pages.update({ page_id: id, parent });
     return { id: page.id, url: page.url };
   }
 
@@ -1033,14 +1101,22 @@ class NotionClient {
       properties = { title: { title: [{ type: 'text', text: { content: newTitle } }] } };
     }
 
-    // Determine parent
+    // Determine parent. Database rows are now parented to a data_source_id;
+    // responses usually still expose the owning database_id alongside it.
     const parent = source.parent;
     let parentId = newParentId;
     let isDatabase = false;
     if (!parentId) {
-      if (parent.database_id) { parentId = parent.database_id; isDatabase = true; }
-      else if (parent.page_id) { parentId = parent.page_id; }
-      else { throw new Error('Cannot determine parent for duplication'); }
+      if (parent.database_id) {
+        parentId = parent.database_id; isDatabase = true;
+      } else if (parent.data_source_id) {
+        isDatabase = true;
+        throw new Error('Source is a database row whose parent exposes only data_source_id — pass new_parent_id (the database id) explicitly to duplicate.');
+      } else if (parent.page_id) {
+        parentId = parent.page_id;
+      } else {
+        throw new Error('Cannot determine parent for duplication');
+      }
     }
 
     // Convert content back to blocks
