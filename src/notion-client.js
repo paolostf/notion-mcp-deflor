@@ -114,14 +114,24 @@ class NotionClient {
   async _resolveDataSourceId(databaseId, client) {
     const id = this._cleanId(databaseId);
     if (this._dsCache.has(id)) return this._dsCache.get(id);
-    const db = await client.databases.retrieve({ database_id: id });
-    const sources = db.data_sources || [];
-    if (sources.length === 0) {
-      throw new Error(`Database ${id} has no data sources — cannot query/create. (Notion 2025-09-03 model)`);
+    try {
+      const db = await client.databases.retrieve({ database_id: id });
+      const sources = db.data_sources || [];
+      if (sources.length === 0) {
+        throw new Error(`Database ${id} has no data sources — cannot query/create. (Notion 2025-09-03 model)`);
+      }
+      const dsId = sources[0].id;
+      this._dsCache.set(id, dsId);
+      return dsId;
+    } catch (err) {
+      // The id may already BE a data_source_id (e.g. passed through from search).
+      if (err?.code === 'object_not_found' || err?.status === 404) {
+        await client.dataSources.retrieve({ data_source_id: id });  // throws if invalid
+        this._dsCache.set(id, id);
+        return id;
+      }
+      throw err;
     }
-    const dsId = sources[0].id;
-    this._dsCache.set(id, dsId);
-    return dsId;
   }
 
   /** @deprecated — backward compat, routes to default workspace */
@@ -140,7 +150,11 @@ class NotionClient {
   async search(query, { filter_type, sort_direction, page_size, workspace } = {}) {
     const client = this._getClient(workspace);
     const params = { query, page_size: page_size || 10 };
-    if (filter_type) params.filter = { property: 'object', value: filter_type };
+    if (filter_type) {
+      // 2025-09-03: the search filter value for databases is now 'data_source'.
+      const value = filter_type === 'database' ? 'data_source' : filter_type;
+      params.filter = { property: 'object', value };
+    }
     if (sort_direction) params.sort = { direction: sort_direction, timestamp: 'last_edited_time' };
 
     const response = await client.search(params);
@@ -157,15 +171,30 @@ class NotionClient {
                 : r.parent?.type === 'data_source_id' ? `data_source:${r.parent.data_source_id}`
                 : r.parent?.type,
         };
-      } else if (r.object === 'database') {
-        const title = r.title?.map(t => t.plain_text).join('') || 'Untitled';
-        return {
+      } else if (r.object === 'data_source' || r.object === 'database') {
+        // Normalize data sources back to a user-facing "database": expose the
+        // owning database id (so fetch_database/query_database keep working)
+        // plus the data_source_id for callers that need it directly.
+        const titleArr = r.title || r.name;
+        const title = Array.isArray(titleArr)
+          ? titleArr.map(x => x.plain_text || '').join('')
+          : (typeof r.name === 'string' ? r.name : 'Untitled');
+        const databaseId = r.object === 'data_source'
+          ? (r.parent?.database_id || r.database_parent?.database_id || r.database_id || r.id)
+          : r.id;
+        const result = {
           type: 'database',
-          id: r.id,
-          title,
+          id: databaseId,
+          title: title || 'Untitled',
           url: r.url,
           last_edited: r.last_edited_time,
         };
+        if (r.object === 'data_source') {
+          result.data_source_id = r.id;
+          // Pre-cache so downstream query/create skips a lookup.
+          this._dsCache.set(this._cleanId(databaseId), r.id);
+        }
+        return result;
       }
       return { type: r.object, id: r.id };
     });
@@ -221,7 +250,32 @@ class NotionClient {
   async fetchDatabase(databaseId, { workspace } = {}) {
     const client = this._getClient(workspace);
     const id = this._cleanId(databaseId);
-    const db = await client.databases.retrieve({ database_id: id });
+
+    let db;
+    try {
+      db = await client.databases.retrieve({ database_id: id });
+    } catch (err) {
+      // id may be a data_source_id (from search) — build a database-shaped view.
+      if (err?.code === 'object_not_found' || err?.status === 404) {
+        const ds = await client.dataSources.retrieve({ data_source_id: id });
+        this._dsCache.set(id, id);
+        return {
+          id: ds.parent?.database_id || id,
+          data_source_id: id,
+          title: (ds.title || ds.name)?.map?.(t => t.plain_text).join('') || 'Untitled',
+          url: ds.url,
+          icon: ds.icon?.emoji || ds.icon?.external?.url || null,
+          description: ds.description?.map?.(t => t.plain_text).join('') || '',
+          is_inline: undefined,
+          created_time: ds.created_time,
+          last_edited_time: ds.last_edited_time,
+          data_sources: [{ id, name: ds.name }],
+          schema: formatDatabaseSchema(ds.properties || {}),
+        };
+      }
+      throw err;
+    }
+
     const title = db.title?.map(t => t.plain_text).join('') || 'Untitled';
 
     // Schema lives on the data source now (2025-09-03 split), not the database.
