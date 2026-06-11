@@ -8,10 +8,17 @@ Notion Unlocked breaks through every one of those walls. Multi-workspace routing
 
 This isn't a wrapper. It's what a Notion MCP server looks like when built by someone who actually uses Notion at scale.
 
-**Version:** 2.4.0
-**Transport:** StreamableHTTP (`/mcp` endpoint)
+**Version:** 3.0.1
+**Transport:** StreamableHTTP (`/mcp` endpoint) · optional `MCP_AUTH_TOKEN` bearer auth
 **Runtime:** Node.js 18+ / Express
-**API:** Notion Public API via `@notionhq/client`
+**API:** Notion Public API via `@notionhq/client` **v5** — `Notion-Version 2026-03-11`, data-sources model
+
+## Changelog (recent)
+
+- **v3.0.1** (2026-06-11) — fix `search` for the data-sources model (filter value `data_source`, normalize results to expose the owning database id + `data_source_id`).
+- **v3.0.0** (2026-06-11) — modernize to the 2026 public API: bump `@notionhq/client` to v5, `notionVersion 2026-03-11`, migrate databases→**data sources** (`dataSources.query/retrieve/update`, `data_source_id` parents, `initial_data_source`), `archived→in_trash`, `blocks.delete()`. Infra: optional bearer auth, version from package.json, crash guards, graceful shutdown, `/live`+`/ready` probes, **parallel** batch tools.
+- v2.6.0 — surgical 3-tier content editing (in-place > surgical replace > full replace).
+- v2.5.0 — fix timeouts + encoding on large page updates.
 
 ---
 
